@@ -1,0 +1,66 @@
+[Unit]
+Description=Write the system clock back to the Witty Pi 4 RTC
+
+# The other half of wittypi-clock.service. That one reads the RTC at boot;
+# this one writes it back once the clock is known good, so the next boot has
+# a real time to read.
+
+# ── Why gate on the sync file, not just a passive target ────────────────────
+# Writing the RTC from a clock that is itself still at the boot-time floor
+# would persist that floor — the board would then come up at the floor
+# confidently, having stored it, and every subsequent boot would look like a
+# working RTC holding a wrong time. That's worse than no write at all,
+# because it destroys the "year reads 00" tell that RTC-reading tooling uses
+# to detect a dead backup coin cell.
+#
+# A target being "reached" is not evidence of an actual time sync — a target
+# like that is passive, reached whenever nothing is actively delaying it, and
+# whatever normally delays it for a real sync may be disabled or absent in a
+# given image. Depend on the concrete signal instead: the time-sync daemon
+# creates a marker file (e.g. /run/systemd/timesync/synchronized) only after
+# a successful sync, and removes it on shutdown. A ConditionPathExists on
+# that file means this unit is *skipped* — not failed — on every boot that
+# has no real time yet, which is the normal case for a board whose network
+# link comes up minutes late or not at all.
+#
+# Kept as a Condition rather than a Requires so the skip is quiet and visible
+# (`systemctl status` reports a condition-check skip) rather than a failed
+# unit on a board that's behaving correctly.
+After=time-sync.target
+ConditionPathExists=/run/systemd/timesync/synchronized
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# ── Every field is read back and compared by the tool ──────────────────────
+# `wittypi rtc-write` verifies what it wrote rather than printing what it
+# intended to write. That's not decoration — a date-formatting bug that
+# quietly drops a leading-zero month (a classic POSIX-shell octal-literal
+# trap: "08"/"09" aren't valid octal digits) is exactly the kind of thing
+# that looks fine in the code and wrong on the device; a tool that only
+# prints what it sent would report success while storing a corrupt date.
+#
+# flock: this unit fires whenever the network time syncs, which isn't
+# ordered against anything else on the Pi side that touches the same I2C
+# bus/registers (a supervisor's own RTC-plausibility check, for instance).
+# See wittypi-clock.service for why a lock is used here rather than another
+# explicit ordering dependency.
+ExecStart=/usr/bin/flock -w 10 /run/wittypi.lock /usr/bin/wittypi rtc-write
+
+# Exit 1 is "no controller on the bus" — a normal bench configuration. A
+# corrupt write is exit 2 and is deliberately NOT whitelisted: it means the
+# RTC now holds a time nobody should trust, and it must show in
+# `systemctl status`.
+SuccessExitStatus=0 1
+
+# ── No [Install]: this is triggered, not enabled ────────────────────────────
+# wittypi-rtc-save.path is what pulls this in, when the sync file appears. If
+# this unit were also WantedBy=multi-user.target it would run once at boot,
+# find the condition unmet (network time can't have synced that early), and
+# be skipped — then the .path would start it again once sync actually lands.
+# Harmless but confusing in the journal, and it's the arrangement that can
+# make a naive condition-only approach look like it works while guaranteeing
+# it never actually does.

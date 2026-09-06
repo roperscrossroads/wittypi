@@ -1,0 +1,831 @@
+#!/bin/sh
+# Every timing window in the node, read from ITS OWN SOURCE, in one table —
+# then the relationships between them, then the hazards.
+#
+# ── WHY THIS EXISTS ────────────────────────────────────────────────────────
+# The node's behaviour is decided by ~20 numbers that live in eight files, in
+# five units (seconds, deci-seconds, hours, 1 Hz tick counts, and a bare count
+# of attempts), owned by four components — a Yocto distro, a set of systemd
+# drop-ins, a POSIX shell policy script, and AVR firmware this repo does not
+# build. Nothing renders them together, so every question of the form "does X
+# still fit inside Y" has been answered by reading four files and doing
+# arithmetic in your head.
+#
+# That has now failed five times in two days. Every one of them was a value
+# that was individually correct and wrong in company:
+#
+#   WITTYPI_MARKGOOD_GRACE=120 inside a 15 s power-cut budget
+#   GUARANTEED_WAKE=24 h against a 24 h duty cycle
+#   GRACE=8 consumed by a `sleep 5` loop, which waits 10
+#   DEFAULT_ON_DELAY=254 into `delay(reg * 1000)` on a 16-bit int
+#   thermal inhibit 120 s against a mark-good at 312 s
+#
+# The test suite PINS the relationships that must hold — that is a gate, and it
+# belongs in CI. This is the other half: the thing you read when you are about
+# to CHANGE one of these numbers and need to see what else moves. A gate says
+# pass or fail; this says what the system is.
+#
+# ── IT RUNS IN TWO PLACES, AND THAT IS THE POINT ───────────────────────────
+# In the repo it reads the shipped sources — the COMPILED defaults, i.e. what
+# an unconfigured node gets.
+#
+# On the node it reads the INSTALLED copies of the same files, plus the two
+# things no build can see:
+#
+#   * /data/wittypi.env — the site override. The deployed node runs a 20 s
+#     power-cut budget that exists nowhere in this repo.
+#   * the controller's own registers — what is actually in the ATtiny's EEPROM,
+#     which is the only authority on what the hardware will do. A policy that
+#     was never applied and a policy that was applied look identical from the
+#     source tree.
+#
+# So the two modes can disagree, and when they do the board is right.
+# Run it in the repo to reason about a change; run it on the node to find out
+# what you are actually running.
+#
+# ── WHAT IT CANNOT COMPUTE, AND HOW THAT STAYS HONEST ──────────────────────
+# Two classes of value are not derivable from anything in this tree: how long
+# the hardware actually takes (measured with a stopwatch), and the controller's
+# firmware constants (compiled into an AVR binary that is neither in this repo
+# nor on the node). Both live in `timing-terms`, beside this file, which SHIPS
+# INTO THE IMAGE VERBATIM — so the node reads the same bytes rather than a copy.
+#
+# Nothing is pinned in this script. Where the firmware SOURCE happens to be
+# reachable it is cross-checked against timing-terms and a disagreement is a
+# hazard, which is the check that matters the day the controller is recompiled.
+# On the board the revision register is read and compared as well, because a
+# stock controller and a modified one are indistinguishable over I2C unless
+# somebody bumped I2C_FW_REVISION.
+#
+# usage:  timing-windows [--no-live] [--cycle SECONDS] [--on SECONDS]
+#         --no-live      skip controller register reads (board mode)
+#         --cycle N      duty-cycle period for the guaranteed-wake check
+#                        (default 86400 — one wake per day)
+#         --on N         awake-window length for the mark-good check
+#                        (default: derived from alarm2 on the board; the check
+#                        is SKIPPED, not guessed, when no schedule is set)
+#
+# exit 0 = every invariant holds · exit 1 = at least one does not
+set -eu
+
+LIVE=1
+CYCLE_SEC=${WITTYPI_CYCLE_SEC:-86400}
+ON_SEC=${WITTYPI_ON_SEC:-}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-live) LIVE=0 ;;
+        --cycle)   CYCLE_SEC=$2; shift ;;
+        --on)      ON_SEC=$2; shift ;;
+        -h|--help) sed -n '/^# usage:/,/^# exit/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+# ── Locating the sources ───────────────────────────────────────────────────
+# Deliberately by FILE existence, not by a --mode flag: the wrong mode would
+# read nothing and report a table full of blanks, which looks like a system
+# with no timing constants rather than a script pointed at the wrong tree.
+#
+# The repo root is found by ascending, not by counting `..`, so that moving
+# this file does not break it. The marker is the driver library, which sits at
+# the repo root beside this script.
+SELF=$(unset CDPATH; cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || SELF=
+REPO=
+_d=$SELF
+while [ -n "$_d" ] && [ "$_d" != / ]; do
+    if [ -r "$_d/wittypi-lib.sh" ]; then REPO=$_d; break; fi
+    _d=$(dirname "$_d")
+done
+
+# Terms this repo does not own. wake-guard, notify-state and the boot-health
+# and storage machinery belong to the integrator's site layer; the watchdog,
+# NTP, A/B and bootloader settings belong to their image. This script reports
+# on them because the BUDGET spans all of it — a shutdown budget is only
+# meaningful as a sum — but it cannot find them on its own. Point it at them
+# and the corresponding rows fill in; leave them unset and those rows read `?`,
+# which is the honest answer rather than a blank that looks like zero.
+SITE_DIR=${WITTYPI_TIMING_SITE_DIR:-}
+WATCHDOG=${WITTYPI_TIMING_WATCHDOG:-}
+NTPCONF=${WITTYPI_TIMING_NTPCONF:-}
+RAUCCONF=${WITTYPI_TIMING_ABCONF:-}
+BOOTCMD=${WITTYPI_TIMING_BOOTCMD:-}
+
+if [ -n "$REPO" ]; then
+    MODE=repo
+    # Flat repo layout: every shipped script at the root, units in systemd/.
+    WP_DIR=$REPO
+    # This repo's own units are always in systemd/. UNIT_DIR may be pointed
+    # elsewhere to pick up the integrator's units, so the two are tracked
+    # separately and unit_file searches both — otherwise supplying an
+    # integration tree would silently lose this repo's own terms.
+    OPS_DIR=$REPO/systemd
+    UNIT_DIR=${WITTYPI_TIMING_UNIT_DIR:-$OPS_DIR}
+    SITE_DIR=${SITE_DIR:-$REPO}
+    TERMS=$SELF/timing-terms
+    WHERE="repo $REPO"
+    LIVE=0
+elif [ -r /usr/bin/wittypi ] || [ -r /usr/libexec/site/wittypi-lib.sh ]; then
+    MODE=board
+    WP_DIR=/usr/libexec/site
+    SITE_DIR=${SITE_DIR:-/usr/libexec/site}
+    WATCHDOG=${WATCHDOG:-/etc/systemd/system.conf.d/10-watchdog.conf}
+    NTPCONF=${NTPCONF:-/etc/systemd/timesyncd.conf.d/10-ntp-servers.conf}
+    RAUCCONF=${RAUCCONF:-/usr/lib/rauc/system.conf}
+    # Shipped as file CONTENT, not metadata: mkfs restamps inodes, so anything
+    # that must survive into the image has to be content.
+    TERMS=/usr/lib/site/timing-terms
+    # systemd's unit dir is /usr/lib on a usrmerge image and /lib without, so
+    # ask rather than assume.
+    for d in /usr/lib/systemd/system /lib/systemd/system; do
+        [ -d "$d" ] && { UNIT_DIR=$d; break; }
+    done
+    UNIT_DIR=${UNIT_DIR:-/usr/lib/systemd/system}
+    OPS_DIR=$UNIT_DIR
+    WHERE="board $(cat /etc/hostname 2>/dev/null || echo '?')"
+else
+    echo "not in the repo and not on a node: found neither" >&2
+    echo "  <repo>/wittypi-lib.sh  (ascending from $SELF)" >&2
+    echo "  /usr/bin/wittypi" >&2
+    exit 2
+fi
+
+# The policy script: /usr/bin/wittypi on the node, the source file in the repo.
+WP_POLICY=$WP_DIR/wittypi
+[ -r "$WP_POLICY" ] || WP_POLICY=/usr/bin/wittypi
+
+# ── Extraction ─────────────────────────────────────────────────────────────
+# One helper, one shape: pull the first capture of a BRE out of a file, or
+# print nothing. Callers decide whether "nothing" is fatal — mostly it is not,
+# because a value that has moved to another file should show as `?` rather than
+# take the whole report down.
+lit() {
+    [ -r "$1" ] || return 0
+    sed -n "s/$2/\1/p" "$1" 2>/dev/null | head -n 1
+}
+
+# Registers 44/52 hold a SIGNED byte: 236 is -20 C, not 236 C. Every place a
+# reading from one of them is DISPLAYED goes through this, including the
+# failure messages — a hazard line that reports 236 where it means -20 C is
+# the one moment the conversion matters most.
+wp_signed_or() { [ "$1" -gt 127 ] && echo $(( $1 - 256 )) || echo "$1"; }
+
+# Units are not all in one place in the repo. On the board every unit sits in
+# UNIT_DIR; in the tree they are split by owner, and wittypi.service lives with
+# the Witty Pi sources rather than with the site layer's. Reading the wrong
+# directory returns nothing, and an empty value here reads as "0" and raises a
+# hazard about a daemon restart that fits perfectly well.
+# Drop-ins are not in the unit directory. On the board a drop-in lives in
+# <unit>.d/ beside the unit it modifies, not in the unit directory itself — so
+# a flat lookup finds 10-wait-online-bounded.conf and 10-bt-attach-retry.conf
+# in the repo (where they sit together) and NOT on the node. The search
+# descends one level for exactly that reason.
+unit_file() {
+    for _u in "$UNIT_DIR/$1" "$OPS_DIR/$1" "$WP_DIR/$1" "$SITE_DIR/$1"; do
+        [ -r "$_u" ] && { printf '%s' "$_u"; return 0; }
+    done
+    _u=$(find "$UNIT_DIR" -mindepth 2 -maxdepth 2 -name "$1" 2>/dev/null | head -n 1)
+    [ -n "$_u" ] && { printf '%s' "$_u"; return 0; }
+    printf '%s' "$UNIT_DIR/$1"
+}
+
+# systemd accepts "2min", "30s", "90" and more. Only the forms actually shipped
+# here are handled, and anything else comes back empty rather than being
+# guessed at — a silently mis-parsed watchdog is worse than a blank.
+secs_of() {
+    case "$1" in
+        '')             printf '' ;;
+        *min)           printf '%s' $(( ${1%min} * 60 )) ;;
+        *m)             printf '%s' $(( ${1%m} * 60 )) ;;
+        *s)             printf '%s' "${1%s}" ;;
+        *[!0-9]*)       printf '' ;;
+        *)              printf '%s' "$1" ;;
+    esac
+}
+
+# ── The terms this repo cannot compute ─────────────────────────────────────
+# Measured times and firmware constants come from timing-terms, which is the
+# ONE home for both and ships into the image verbatim. Nothing is pinned in
+# this file: a second copy that is never compared is how two numbers become
+# three, and a comment promising they will be compared is not a mechanism.
+#
+# This is also why the report prints checksums. Host and target read the
+# same bytes or they do not, and "probably in sync" is not a state anyone can
+# act on. Run it in both places and compare the two numbers.
+term() {
+    _t=$(lit "$TERMS" "^$1=\([0-9][0-9]*\)$")
+    if [ -z "$_t" ]; then
+        printf 'timing-terms is missing %s (looked in %s)\n' "$1" "$TERMS" >&2
+        exit 3
+    fi
+    printf '%s' "$_t"
+}
+
+[ -r "$TERMS" ] || { printf 'no timing-terms at %s\n' "$TERMS" >&2; exit 3; }
+
+T_BOOT=$(term T_BOOT)
+T_MARKGOOD=$(term T_MARKGOOD)
+T_SHUTDOWN=$(term T_SHUTDOWN)
+
+FW_REV_TERM=$(term FW_REV)
+ALARM_WIN=$(term FW_ALARM_WINDOW)
+THERM_INHIBIT=$(term FW_THERMAL_INHIBIT)
+ALARM1_RETRY=$(term FW_ALARM1_RETRY)
+PULSE=$(term FW_PULSE_INTERVAL)
+
+# ── The firmware source, when it is reachable, as a CROSS-CHECK ────────────
+# timing-terms is the home; the firmware source is the authority. They agree
+# or someone changed one without the other — which is precisely what happens
+# when the controller is recompiled with different settings, and precisely the
+# case where every downstream guard quietly starts reasoning about hardware
+# that no longer exists.
+FW_SRC=${WITTYPI_FW_SRC:-}
+FW_DRIFT=
+if [ -r "$FW_SRC" ]; then
+    FW_HOW='timing-terms, cross-checked against the firmware source'
+    FW_WHERE=$(basename "$FW_SRC")
+    _ck() {  # _ck <label> <term-value> <bre>
+        _v=$(lit "$FW_SRC" "$3")
+        [ -n "$_v" ] || { FW_DRIFT="$FW_DRIFT $1(not found in source)"; return 0; }
+        [ "$_v" = "$2" ] || FW_DRIFT="$FW_DRIFT $1(terms $2, source $_v)"
+    }
+    _ck FW_REV            "$FW_REV_TERM"   '.*I2C_FW_REVISION\] = 0x0*\([0-9]*\);.*'
+    _ck FW_ALARM_WINDOW   "$ALARM_WIN"     '.*overdue_alarm1 >= 0 && overdue_alarm1 < \([0-9]*\).*'
+    _ck FW_THERMAL_INHIBIT "$THERM_INHIBIT" '.*skipTempShutdownCount < \([0-9]*\).*'
+    _ck FW_ALARM1_RETRY   "$ALARM1_RETRY"  '.*alarm1Delayed == \([0-9]*\).*'
+    _ck FW_PULSE_INTERVAL "$PULSE"         '.*I2C_CONF_PULSE_INTERVAL\] = \([0-9]*\);.*'
+else
+    FW_HOW='timing-terms'
+    FW_WHERE="rev $FW_REV_TERM, no firmware source here to cross-check"
+fi
+
+# ── Compiled policy defaults ───────────────────────────────────────────────
+# One level of indirection is expected. The policy's fallbacks were hoisted
+# out of the inline ${VAR:-N} form into WP_FALLBACK_N assignments so the tool's
+# own help text could interpolate them rather than repeat them. Without this,
+# every value below would read back as the literal "$WP_FALLBACK_..." and the
+# report would print it as though it were a number.
+deref() {
+    case "$2" in
+        \$*) lit "$1" "^${2#\$}=\\(-\\{0,1\\}[0-9][0-9]*\\).*" ;;
+        *)   printf '%s' "$2" ;;
+    esac
+}
+PCD_DEF=$(deref "$WP_POLICY" "$(lit "$WP_POLICY"   '.*WITTYPI_POWER_CUT_DELAY:-\([^}]*\)}.*')")
+DON_DEF=$(deref "$WP_POLICY" "$(lit "$WP_POLICY"   '.*WITTYPI_DEFAULT_ON_DELAY:-\([^}]*\)}.*')")
+GW_DEF=$(deref "$WP_POLICY" "$(lit "$WP_POLICY"    '.*WITTYPI_GUARANTEED_WAKE:-\([^}]*\)}.*')")
+OVERT_DEF=$(deref "$WP_POLICY" "$(lit "$WP_POLICY" '.*WITTYPI_OVER_TEMP:-\([^}]*\)}.*')")
+
+DON_MAX=$(lit "$WP_DIR/wittypi-lib.sh" '^WP_MAX_DEFAULT_ON_DELAY=\([0-9]*\).*')
+PCD_MIN=$(lit "$WP_DIR/wittypi-lib.sh" '^WP_MIN_POWER_CUT_DELAY=\([0-9]*\).*')
+PCD_MAX=$(lit "$WP_DIR/wittypi-lib.sh" '^WP_MAX_POWER_CUT_DELAY=\([0-9]*\).*')
+
+GRACE=$(lit "$WP_DIR/wittypi-before-shutdown" '.*WITTYPI_MARKGOOD_GRACE:-\([0-9]*\).*')
+POLL=$(lit  "$WP_DIR/wittypi-before-shutdown" '^ *sleep \([0-9][0-9]*\)$')
+SETTLE=$(lit "$WP_DIR/wittypi-daemon" '.*WITTYPI_HALT_SETTLE_SEC:-\([0-9]*\).*')
+
+# The shutdown notification is a third term in the power-cut budget.
+# wittypi-daemon calls notify-state BEFORE the gate, while the network is still
+# up, and that call is on the same 20 s clock the rail is counting. Deriving it
+# here rather than hardcoding it is what keeps the relationship below checking
+# the arithmetic the node actually runs.
+#
+# Zero when the daemon does not call it, so a site that removes the call gets
+# its two-term budget back rather than a phantom reservation.
+# The shutdown sequence has four terms, not two. In order, from the
+# moment GPIO-4 falls and POWER_CUT_DELAY starts counting:
+#
+#   1. wake-guard ensure   (daemon)  arm a fallback wake if none is scheduled
+#   2. notify-state shutdown         say why, and when we intend to be back
+#   3. the mark-good gate            bounded wait for the health verdict
+#   4. Linux shutting down           + a SECOND wake-guard run via ExecStop
+#
+# Deriving terms 1 and 2 here rather than hardcoding them means removing either
+# call from the daemon gives the budget back automatically instead of leaving a
+# phantom reservation behind.
+if grep -q 'WP_WAKE_GUARD.*ensure' "$WP_DIR/wittypi-daemon" 2>/dev/null; then
+    # Bounded by the unit that also runs it on the Linux-initiated path; that
+    # TimeoutStopSec is the only hard cap either invocation has.
+    #
+    # This must read $UNIT_DIR, not $SITE_DIR — on the node they differ.
+    # $SITE_DIR is /usr/libexec/site, where only the wake-guard SCRIPT lives;
+    # the .service is in the systemd unit dir. Reading the wrong one makes the
+    # term silently 0, and the node renders its own budget as
+    # "0 + 2 + 8 + 8 = 18 < 25, ok" — five seconds under-counted, with an ok
+    # verdict. In repo mode the two dirs are the same, so an offline check
+    # passes either way. The familiar shape: confident output that could not
+    # fail.
+    WAKE_GUARD_SD=$(lit "$(unit_file wake-guard.service)" '^TimeoutStopSec=\([0-9]*\).*')
+    WAKE_GUARD_SD=${WAKE_GUARD_SD:-0}
+else
+    WAKE_GUARD_SD=0
+fi
+
+NOTIFY_STATE="$SITE_DIR/notify-state"
+if grep -q 'WP_NOTIFY_STATE.*shutdown' "$WP_DIR/wittypi-daemon" 2>/dev/null; then
+    NOTIFY_SD=$(lit "$NOTIFY_STATE" '.*NOTIFY_STATE_SHUTDOWN_TIMEOUT:-\([0-9]*\).*')
+    NOTIFY_SD=${NOTIFY_SD:-0}
+else
+    NOTIFY_SD=0
+fi
+
+# The supervisor's stop, in the coincidence case: a shutdown racing a
+# wittypi-watch tick stops the watch FIRST (its unit's After=wake-guard
+# inverts to stop-before), THEN runs wake-guard's ExecStop — serialised, so
+# the watch's TimeoutStopSec is a real addend, not overlap. Derived from the
+# unit like the terms above: no supervisor installed, no reservation.
+_watch_unit=$(unit_file wittypi-watch.service)
+if [ -r "$_watch_unit" ]; then
+    WATCH_SD=$(lit "$_watch_unit" '^TimeoutStopSec=\([0-9]*\).*')
+    WATCH_SD=${WATCH_SD:-0}
+else
+    WATCH_SD=0
+fi
+
+# Effective, not configured. The whole reason this file computes rather than
+# reports: a deadline of 8 inside a loop that sleeps 5 unconditionally is a
+# deadline of 10. The clamp (`sleep "$wp_left"` on the last iteration) is what
+# makes 8 mean 8, so its PRESENCE is what decides which arithmetic applies.
+if grep -q 'sleep "[$]wp_left"' "$WP_DIR/wittypi-before-shutdown" 2>/dev/null; then
+    GRACE_EFF=$GRACE
+    GRACE_NOTE="clamped"
+else
+    GRACE_EFF=$(( ( (GRACE + POLL - 1) / POLL ) * POLL ))
+    GRACE_NOTE="rounded up to a multiple of ${POLL}s by the poll loop"
+fi
+
+SOAK=$(lit "$SITE_DIR/boot-health-check" '.*HEALTH_SOAK_SEC:-\([0-9]*\).*')
+GUARD_INT=$(lit "$SITE_DIR/storage-guard" '.*GUARD_INTERVAL:-\([0-9]*\).*')
+SLOT_FAIL=$(lit "$SITE_DIR/boot-slot-health" '.*SLOT_FAIL_THRESHOLD:-\([0-9]*\).*')
+
+# Resolved once, through the same helper as the other unit reads below, and
+# reused by the relationship checks so the value read and the file tested for
+# presence can never be two different paths.
+STORAGE_GUARD_UNIT=$(unit_file storage-guard.service)
+BOOT_GATE_UNIT=$(unit_file boot-health-check.service)
+GUARD_WD=$(secs_of "$(lit "$STORAGE_GUARD_UNIT" '^WatchdogSec=\(.*\)$')")
+GATE_TMO=$(secs_of "$(lit "$BOOT_GATE_UNIT" '^TimeoutStartSec=\(.*\)$')")
+RT_WD=$(secs_of "$(lit "$WATCHDOG" '^RuntimeWatchdogSec=\(.*\)$')")
+RB_WD=$(secs_of "$(lit "$WATCHDOG" '^RebootWatchdogSec=\(.*\)$')")
+NTP_MIN=$(lit "$NTPCONF" '^PollIntervalMinSec=\([0-9]*\).*')
+NTP_MAX=$(lit "$NTPCONF" '^PollIntervalMaxSec=\([0-9]*\).*')
+ATTEMPTS=$(lit "$RAUCCONF" '^boot-attempts=\([0-9]*\).*')
+
+# ── Bounded waits ──────────────────────────────────────────────────────────
+# These do not couple to the duty cycle the way the power-sequencing constants
+# do, which is exactly why they are easy to overlook — but they all bound how
+# long a boot can take, and the health gate has to outlast their sum or the
+# slot is condemned by patience.
+# boot-request is a human-facing command, so it goes to ${bindir} rather than
+# libexec — the same placement, and the same reasoning, as wittypi itself.
+site_cmd() {
+    for _c in "$SITE_DIR/$1" "/usr/bin/$1"; do
+        [ -r "$_c" ] && { printf '%s' "$_c"; return 0; }
+    done
+    printf '%s' "$SITE_DIR/$1"
+}
+DAEMON_RESTART=$(secs_of "$(lit "$(unit_file wittypi.service)" '^RestartSec=\(.*\)$')")
+WIFI_TMO=$(secs_of "$(lit "$(unit_file wifi-autostart.service)" '^TimeoutStartSec=\(.*\)$')")
+NTP_SAVE=$(lit "$NTPCONF" '^SaveIntervalSec=\([0-9]*\).*')
+WAIT_ONLINE=$(lit "$(unit_file 10-wait-online-bounded.conf)" '^ExecStart=.*--timeout=\([0-9]*\).*')
+BT_RETRY=$(lit "$(unit_file 10-bt-attach-retry.conf)" '^ExecStart=.*bt-attach [a-z0-9]* \([0-9]*\) *$')
+CONSOLE_DELAY=$(lit "$(site_cmd boot-request)" '.*CONSOLE_DELAY:-\([0-9]*\).*')
+PANIC=$(lit "$BOOTCMD" '.*panic=\([0-9]*\).*')
+
+# ── Live values: the site override and the hardware itself ─────────────────
+PCD=$PCD_DEF; DON=$DON_DEF; GW=$GW_DEF
+PCD_SRC="compiled default"; DON_SRC="compiled default"; GW_SRC="compiled default"
+FW_REV=; DEFAULT_ON=; PWR_MODE=; OVERT_ACT=
+# Declared here, not only inside the live block. `set -u` makes an unset
+# reference fatal, and repo mode never enters that block — without these
+# declarations the LM75B check kills the report outright whenever it runs
+# offline, while board mode passes, which is exactly how a half-tested
+# addition looks.
+MCU_OVERT=; MCU_BELOWT=; LM_TOS=; LM_THYST=
+
+ENVFILE=/data/wittypi.env
+if [ "$MODE" = board ] && [ -r "$ENVFILE" ]; then
+    # Sourced in a subshell and read back, never into this shell: the file is
+    # site-writable and this script must not inherit whatever else is in it.
+    for v in POWER_CUT_DELAY DEFAULT_ON_DELAY GUARANTEED_WAKE; do
+        val=$(lit "$ENVFILE" "^WITTYPI_$v=\([0-9]*\).*")
+        [ -n "$val" ] || continue
+        case "$v" in
+            POWER_CUT_DELAY)  PCD=$val; PCD_SRC="site $ENVFILE" ;;
+            DEFAULT_ON_DELAY) DON=$val; DON_SRC="site $ENVFILE" ;;
+            GUARANTEED_WAKE)  GW=$val;  GW_SRC="site $ENVFILE" ;;
+        esac
+    done
+fi
+
+# One register read, defined at top level because the awake-window derivation
+# below needs it too and a helper that exists only inside one branch is a trap.
+r() { wittypi get "$1" 2>/dev/null | tr -dc '0-9-' ; }
+
+if [ "$LIVE" = 1 ] && command -v wittypi >/dev/null 2>&1; then
+    # EEPROM beats both files. A register holds what was last WRITTEN to it;
+    # a policy file holds what the next `wittypi configure` would write. Those
+    # differ on any node where configure has not run since the file changed,
+    # and that gap is exactly where the 254 outage lived.
+    v=$(r 21); [ -n "$v" ] && { PCD=$(( v / 10 )); PCD_SRC="register 21 (live)"; }
+    v=$(r 47); [ -n "$v" ] && { DON=$v; DON_SRC="register 47 (live)"; }
+    v=$(r 49); [ -n "$v" ] && {
+        # bit 7 is the unit: 0 = hours, 1 = days.
+        if [ "$(( v & 128 ))" -ne 0 ]; then
+            GW=$(( (v & 127) * 24 )); GW_SRC="register 49 (live, days)"
+        else
+            GW=$(( v & 127 )); GW_SRC="register 49 (live, hours)"
+        fi
+    }
+    FW_REV=$(r 12); DEFAULT_ON=$(r 17); PWR_MODE=$(r 7); OVERT_ACT=$(r 45)
+    # The MCU's copies of the temperature points, and the LM75B's OWN registers.
+    # They are written from the copies, but only at MCU reset — see the check.
+    MCU_OVERT=$(r 46); MCU_BELOWT=$(r 44)
+    LM_TOS=$(r 53);    LM_THYST=$(r 52)
+fi
+
+# ── The awake window ───────────────────────────────────────────────────────
+# The awake window is not /proc/uptime, and substituting one for the other asks
+# a different question. Uptime is how long the node has been up SO FAR; the
+# awake window is how long it will be up in TOTAL. Read 270 s into a boot,
+# uptime reports a 270 s window and raises a hazard against a mark-good at
+# 312 s on a node with no schedule set at all — a plausible number from a
+# plausible file that does not mean what the check needs.
+#
+# The window is alarm2 minus power-on, and alarm2 lives in registers 32-36 as
+# BCD. When it is unset there IS no window, and the honest answer is to say so
+# and assert nothing — a check that invents its own input is worse than absent,
+# because it produces confident output.
+ON_WHY=
+if [ -z "$ON_SEC" ] && [ "$LIVE" = 1 ] && command -v wittypi >/dev/null 2>&1; then
+    bcd() { printf '%s' $(( ( ${1:-0} / 16 ) * 10 + ( ${1:-0} % 16 ) )); }
+    a2s=$(r 32); a2m=$(r 33); a2h=$(r 34); a2d=$(r 35)
+    if [ "${a2s:-0}${a2m:-0}${a2h:-0}${a2d:-0}" = "0000" ]; then
+        ON_WHY="no alarm2 is set — nothing will shut this node down on a schedule"
+    else
+        # Same arithmetic the firmware uses: date*86400 + h*3600 + m*60 + s.
+        _a2=$(( $(bcd "$a2d") * 86400 + $(bcd "$a2h") * 3600 \
+                + $(bcd "$a2m") * 60 + $(bcd "$a2s") ))
+        _now=$(date -u '+%_d %_H %_M %_S' 2>/dev/null | \
+               awk '{print $1 * 86400 + $2 * 3600 + $3 * 60 + $4}')
+        _up=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+        if [ -n "$_now" ] && [ -n "$_up" ] && [ "$_a2" -gt "$_now" ]; then
+            ON_SEC=$(( _up + _a2 - _now ))
+            ON_WHY="alarm2 in $(( _a2 - _now ))s + ${_up}s already up"
+        else
+            ON_WHY="alarm2 is set but not ahead of the clock (overdue, or next month)"
+        fi
+    fi
+fi
+
+# ── Rendering ──────────────────────────────────────────────────────────────
+if [ -t 1 ]; then B=$(printf '\033[1m'); R=$(printf '\033[31m'); G=$(printf '\033[32m')
+                 Y=$(printf '\033[33m'); Z=$(printf '\033[0m')
+else B=; R=; G=; Y=; Z=; fi
+
+hdr() { printf '\n%s── %s ──%s\n' "$B" "$1" "$Z"; }
+row() { printf '  %-30s %10s   %s\n' "$1" "${2:-?}" "${3:-}"; }
+
+hazards=0; notes=0
+ok()   { printf '  %sok%s    %s\n' "$G" "$Z" "$1"; }
+haz()  { printf '  %sHAZARD%s %s\n         %s\n' "$R" "$Z" "$1" "$2"; hazards=$((hazards + 1)); }
+note() { printf '  %snote%s  %s\n' "$Y" "$Z" "$1"; notes=$((notes + 1)); }
+
+# ── The fingerprint ────────────────────────────────────────────────────────
+# This is the one line that answers "are the host and the node in sync?"
+# This script and its terms file ship into the image as the SAME BYTES they
+# have in the repo — there is no generation step, no template, no second copy.
+# So a repo run and a board run print the same two checksums, or they do not,
+# and "probably the same version" stops being a thing anyone has to assume.
+#
+# "busybox has cksum everywhere" is an assumption, not a check, and it does not
+# hold here: the node has md5sum and sha256sum and no cksum. A single hardcoded
+# tool makes the fingerprint line print EMPTY — empty rather than '?', because
+# a `||` fallback only fires if the whole pipeline fails, and `cut` succeeds
+# happily on no input. The one line built to answer "are these two in sync?"
+# would then silently answer nothing.
+#
+# So: try tools in order, take the first that produces output, and say WHICH
+# one produced it — comparing an md5 against a sha256 would otherwise look like
+# a real mismatch. If none work, say so out loud.
+fp() {
+    for _t in md5sum sha256sum cksum; do
+        command -v "$_t" >/dev/null 2>&1 || continue
+        _v=$("$_t" "$1" 2>/dev/null | cut -d' ' -f1 | cut -c1-12)
+        [ -n "$_v" ] && { printf '%s:%s' "${_t%sum}" "$_v"; return 0; }
+    done
+    printf 'UNAVAILABLE'
+}
+
+printf '%swittypi — every timing window, and what couples them%s\n' "$B" "$Z"
+printf 'read from: %s\n' "$WHERE"
+printf 'fingerprint: script %s · terms %s   %s\n' \
+    "$(fp "$0")" "$(fp "$TERMS")" \
+    "$([ "$MODE" = repo ] && printf 'run this on the node; equal numbers = same logic, same terms' \
+                          || printf 'compare with the same script run in the repo')"
+printf 'firmware constants: %s (%s)\n' "$FW_HOW" "$FW_WHERE"
+[ "$LIVE" = 1 ] && printf 'controller registers: live\n' \
+                || printf 'controller registers: not read%s\n' \
+                   "$([ "$MODE" = repo ] && echo ' (repo mode — there is no hardware here)')"
+
+hdr "CONTROLLER — ATtiny841. Every counter below is a 1 Hz tick"
+row "alarm match window" "${ALARM_WIN}s" "coincidence test, NOT a timeout"
+row "thermal inhibit after power-on" "${THERM_INHIBIT}s" "over/below-temp action suppressed"
+row "alarm1 delayed retry" "${ALARM1_RETRY}s" "when a wake lands while powered"
+row "power-cut delay (reg 21)" "${PCD}s" "$PCD_SRC"
+row "default-on delay (reg 47)" "${DON}s" "$DON_SRC"
+row "guaranteed wake (reg 49)" "${GW}h" "$GW_SRC"
+row "sleep pulse (reg 18)" "${PULSE}s" "firmware factory default; policy does not set it"
+[ -n "$FW_REV" ]     && row "firmware revision (reg 12)" "$FW_REV" "live"
+[ -n "$DEFAULT_ON" ] && row "default-on (reg 17)" "$DEFAULT_ON" "1 = return without the button"
+[ -n "$PWR_MODE" ]   && row "power mode (reg 7)" "$PWR_MODE" "0 = USB-C, 1 = VIN"
+
+hdr "LINUX — measured"
+row "T_boot   power-on -> gate" "${T_BOOT}s" "console capture, anchored to btime"
+row "T_markgood power-on -> 3" "${T_MARKGOOD}s" "fw_printenv across four cycles"
+row "T_shutdown" "${T_SHUTDOWN}s" "halt request -> Power down"
+
+hdr "LINUX — configured"
+row "health soak" "${SOAK}s" "to UPTIME ${SOAK}s, not ${SOAK}s after the gate"
+row "mark-good grace" "${GRACE}s -> ${GRACE_EFF}s" "$GRACE_NOTE"
+row "supervisor stop" "${WATCH_SD}s" "wittypi-watch.service — a shutdown budget term, see the sum"
+row "poll interval" "${POLL}s" "wittypi-before-shutdown"
+row "halt-line settle" "${SETTLE}s" "wittypi-daemon"
+row "gate TimeoutStartSec" "${GATE_TMO}s" "boot-health-check.service"
+row "runtime watchdog" "${RT_WD}s" "10-watchdog.conf"
+row "reboot watchdog" "${RB_WD}s" "10-watchdog.conf"
+row "storage-guard watchdog" "${GUARD_WD}s" "storage-guard.service"
+row "storage-guard keepalive" "${GUARD_INT}s" "storage-guard"
+row "kernel panic reboot" "${PANIC:-10}s" "bootargs panic="
+row "NTP poll" "${NTP_MIN}-${NTP_MAX}s" "10-ntp-servers.conf"
+row "NTP clock save" "${NTP_SAVE}s" "timesyncd persists its estimate"
+
+hdr "BOUNDED WAITS — how long a boot is allowed to take"
+row "networkd wait-online" "${WAIT_ONLINE}s" "10-wait-online-bounded.conf"
+row "wifi-autostart start" "${WIFI_TMO}s" "wifi-autostart.service"
+row "bt-attach retry" "${BT_RETRY}s" "10-bt-attach-retry.conf"
+row "wittypi daemon restart" "${DAEMON_RESTART}s" "wittypi.service RestartSec"
+row "console autoboot window" "${CONSOLE_DELAY}s" "boot-request, NEXT boot only"
+
+hdr "COUNTS — not seconds, and they do not decay"
+row "boot attempts per slot" "$ATTEMPTS" "A/B boot config"
+row "slot-fail threshold" "$SLOT_FAIL" "boot-slot-health, CONSECUTIVE"
+if [ "$MODE" = board ] && command -v fw_printenv >/dev/null 2>&1; then
+    for s in A B; do
+        row "BOOT_${s}_LEFT (live)" \
+            "$(fw_printenv "BOOT_${s}_LEFT" 2>/dev/null | cut -d= -f2)" "u-boot env"
+    done
+fi
+
+# ── The relationships ──────────────────────────────────────────────────────
+# Some terms below come from the integrator's site layer and image, not from
+# this repo (see "Terms this repo does not own" above). An absent term there is
+# not a broken extractor, and reporting it as a HAZARD would fill the report
+# with alarms about files that were never meant to be here — the same alarm
+# fatigue the supervisor is written to avoid. So: if the file that OWNS a term
+# is not in this tree, the check says it was not run; if the file IS here and
+# the value still could not be read, that is a real extraction failure and
+# stays a hazard.
+#
+#   have_src FILE...  — true when every named file exists and is readable
+have_src() {
+    for _hs in "$@"; do
+        [ -n "$_hs" ] && [ -r "$_hs" ] || return 1
+    done
+    return 0
+}
+
+hdr "RELATIONSHIPS — each one has been violated at least once"
+
+# 1. The shutdown must finish before the rail is cut. This is THE invariant:
+#    everything downstream of a cut mid-write is a corrupt /data.
+# T_SHUTDOWN includes wake-guard.service's ExecStop, measured from a real
+# `systemctl poweroff` console capture. It is close to a WORST case, not a
+# typical one: alarm1 was cleared before that capture, so the ExecStop took the
+# slow "arm from nothing" path (4.004s of the 8.022s total) rather than the
+# fast already-armed recheck (~0.7s) the real controller-initiated path should
+# usually hit, because wittypi-daemon's own wake-guard call (WAKE_GUARD_SD,
+# budgeted separately below) normally arms it first. A Linux-initiated shutdown
+# with nothing pre-armed gets no such reservation and pays the full cost
+# captured here — a real path, not a contrived one. See timing-terms for the
+# full breakdown.
+# WATCH_SD is the supervisor's term: a shutdown racing a wittypi-watch tick
+# stops the watch first, serialised ahead of wake-guard's ExecStop by the unit
+# ordering, so its TimeoutStopSec is a fifth term.
+_SD_TOTAL=$(( WATCH_SD + WAKE_GUARD_SD + NOTIFY_SD + GRACE_EFF + T_SHUTDOWN ))
+if [ "$_SD_TOTAL" -lt "$PCD" ]; then
+    ok "watch + wake-guard + notify + grace + shutdown < power-cut: ${WATCH_SD} + ${WAKE_GUARD_SD} + ${NOTIFY_SD} + ${GRACE_EFF} + ${T_SHUTDOWN} = ${_SD_TOTAL} < ${PCD}s"
+    # Passing is not the same as having room. T_shutdown is ONE measurement of
+    #    a clean shutdown; a node with more dirty pages, a unit that is slow to
+    #    stop, or a `sync` against a tired card takes longer, and the budget does
+    #    not stretch. The slack should be at least another whole shutdown — so
+    #    that the measurement being wrong by 100% is survivable rather than a
+    #    cut mid-write. At the compiled 15s it is 1s.
+    _slack=$(( PCD - _SD_TOTAL ))
+    note "T_shutdown (${T_SHUTDOWN}s) is a real capture, but close to a
+        worst case (a full wake-guard arm, not its fast recheck) — see timing-terms."
+    if [ "$_slack" -lt "$T_SHUTDOWN" ]; then
+        # The advice has to key off the headroom that actually remains, not
+        # off the configured delay. This note only fires when the slack is
+        # LESS than one shutdown, so any wording claiming that two shutdowns
+        # fit would contradict the branch it is printed from.
+        note "$(printf 'but only %ss of slack, against a shutdown measured ONCE at %ss. A shutdown\n        that runs %ss over budget is cut mid-write. %s' \
+            "$_slack" "$T_SHUTDOWN" "$_slack" \
+            "$([ "$PCD" -lt "$PCD_MAX" ] \
+                && printf 'Raising the power-cut delay to %ss (the ceiling) would buy %ss more\n        for nothing but a longer wait before the rail drops.' "$PCD_MAX" "$(( PCD_MAX - PCD ))" \
+                || printf 'The delay is already at its %ss ceiling. The shutdown notify timeout has\n        already been cut 3s -> 2s (untested) to claw back 1s; the rest needs\n        a re-measurement of the fast (already-armed) wake-guard path or a smaller grace.' "$PCD_MAX")")"
+    fi
+else
+    haz "watch + wake-guard + notify + grace + shutdown >= power-cut: ${WATCH_SD} + ${WAKE_GUARD_SD} + ${NOTIFY_SD} + ${GRACE_EFF} + ${T_SHUTDOWN} = ${_SD_TOTAL} >= ${PCD}s" \
+        "the rail falls mid-shutdown. /data is mounted rw until the very end of it."
+fi
+
+# 2. Register 21 is deci-seconds in ONE BYTE, and 255 is the never-written
+#    sentinel — so the representable ceiling is 25 s, not 25.5.
+if [ "$PCD" -le "${PCD_MAX:-25}" ] && [ "$PCD" -ge "${PCD_MIN:-15}" ]; then
+    ok "power-cut delay in range: ${PCD_MIN:-15} <= ${PCD} <= ${PCD_MAX:-25}s"
+else
+    haz "power-cut delay ${PCD}s is outside ${PCD_MIN:-15}..${PCD_MAX:-25}" \
+        "reg 21 stores x10 in a byte and 255 means 'never written'; below ${PCD_MIN:-15}s there is no shutdown budget."
+fi
+
+# 3. The overflow that cost a 23-minute outage: delay(reg * 1000) on a 16-bit
+#    int. 33 * 1000 = 33000, already past 32767, and the sign flip becomes
+#    ~49.7 DAYS of rail-off — indistinguishable from dead hardware.
+if [ "$DON" -le "${DON_MAX:-32}" ]; then
+    ok "default-on delay within the firmware's arithmetic: ${DON} <= ${DON_MAX:-32}"
+else
+    haz "default-on delay ${DON} overflows the firmware" \
+        "delay(${DON} * 1000) wraps a 16-bit int; the rail stays down for weeks, looking exactly like a dead board."
+fi
+
+# 4. Layer 3 must OUTLAST the scheduled wake it backs up, or it fires first and
+#    the backup becomes the mechanism.
+if [ "$(( GW * 3600 ))" -gt "$CYCLE_SEC" ]; then
+    ok "guaranteed wake outlasts the cycle: ${GW}h > $(( CYCLE_SEC / 3600 ))h"
+else
+    haz "guaranteed wake ${GW}h does not clear a $(( CYCLE_SEC / 3600 ))h cycle" \
+        "layer 3 races the alarm it exists to back up; a healthy node wakes on the wrong mechanism and you never learn the alarm broke."
+fi
+
+# 5. A gate that times out before its own soak completes fails the boot it was
+#    about to pass.
+if ! have_src "$SITE_DIR/boot-health-check" "$BOOT_GATE_UNIT"; then
+    note "boot gate vs soak NOT CHECKED: no boot-health gate in this tree.
+        Set WITTYPI_TIMING_SITE_DIR/_UNIT_DIR to include one."
+elif [ -n "$GATE_TMO" ] && [ -n "$SOAK" ] && [ "$GATE_TMO" -gt "$SOAK" ]; then
+    ok "gate timeout exceeds the soak: ${GATE_TMO} > ${SOAK}s"
+else
+    haz "gate timeout ${GATE_TMO}s does not exceed the soak ${SOAK}s" \
+        "the health gate is killed mid-soak, so the boot is never marked good and repeated boots condemn the slot."
+fi
+
+# 6. One missed keepalive must not be a reset. Two is a signal; one is jitter.
+if ! have_src "$SITE_DIR/storage-guard" "$STORAGE_GUARD_UNIT"; then
+    note "storage-guard watchdog NOT CHECKED: no storage-guard in this tree."
+elif [ -n "$GUARD_WD" ] && [ -n "$GUARD_INT" ] && [ "$GUARD_WD" -ge "$(( GUARD_INT * 2 ))" ]; then
+    ok "storage-guard watchdog >= 2x keepalive: ${GUARD_WD} >= $(( GUARD_INT * 2 ))s"
+else
+    haz "storage-guard watchdog ${GUARD_WD}s < 2x keepalive $(( ${GUARD_INT:-0} * 2 ))s" \
+        "a single late keepalive reboots the node with FailureAction=reboot-immediate."
+fi
+
+# 7. The awake window has to be long enough to GET the attempt back. A node
+#    that wakes, works, and sleeps before mark-good spends an attempt per
+#    cycle and condemns the slot in $ATTEMPTS wakes with nothing wrong.
+if [ -z "$ON_SEC" ]; then
+    note "awake window NOT CHECKED: ${ON_WHY:-no window supplied}.
+        Pass --on SECONDS to test a window this node is not currently running."
+elif [ "$ON_SEC" -gt "$(( T_MARKGOOD + 60 ))" ]; then
+    ok "awake window clears mark-good: ${ON_SEC}s > ${T_MARKGOOD}s + 60s margin${ON_WHY:+  ($ON_WHY)}"
+else
+    haz "awake window ${ON_SEC}s does not clear mark-good ${T_MARKGOOD}s + margin${ON_WHY:+  ($ON_WHY)}" \
+        "each cycle spends a boot attempt that is never returned; ${ATTEMPTS:-3} wakes condemn the slot with nothing actually wrong."
+fi
+
+# 8. The open one. The controller stops suppressing temperature actions long
+#    before Linux gets its attempt back, so there is a window on EVERY boot in
+#    which a trip costs an attempt permanently.
+if [ "$THERM_INHIBIT" -ge "$T_MARKGOOD" ]; then
+    ok "thermal inhibit covers mark-good: ${THERM_INHIBIT} >= ${T_MARKGOOD}s"
+else
+    haz "thermal inhibit (${THERM_INHIBIT}s) expires $(( T_MARKGOOD - THERM_INHIBIT ))s before mark-good (${T_MARKGOOD}s)" \
+        "$(printf 'a %ss window on EVERY boot where a temperature trip spends an attempt nothing returns.%s' \
+            "$(( T_MARKGOOD - THERM_INHIBIT ))" \
+            "$([ "${OVERT_ACT:-1}" = 0 ] && echo ' Currently inert: reg 45 = 0, over-temp action disabled.' || echo " Live: over-temp action is enabled at ${OVERT_DEF}C.")")"
+fi
+
+# 8b. The bounded waits must fit inside the gate that is waiting for them.
+# An unreadable bound is not a bound of zero. Defaulting a missing value to
+# 0 makes the sum smaller and the invariant PASS — the failure mode where a
+# broken extractor reads as good news.
+if ! have_src "$SITE_DIR/boot-health-check" "$BOOT_GATE_UNIT"; then
+    note "bounded waits vs gate NOT CHECKED: no boot-health gate in this tree."
+else
+_missing=
+for _n in WAIT_ONLINE WIFI_TMO BT_RETRY DAEMON_RESTART CONSOLE_DELAY; do
+    eval "_bv=\$$_n"
+    [ -n "$_bv" ] || _missing="$_missing $_n"
+done
+_waits=$(( ${WAIT_ONLINE:-0} + ${WIFI_TMO:-0} + ${BT_RETRY:-0} ))
+if [ -n "$_missing" ]; then
+    haz "bounded waits could not all be read:$_missing" \
+        "the sum below is missing them, so it is smaller than the truth and the check is weaker than it looks. Fix the extractor, do not trust the pass."
+fi
+if [ -n "$GATE_TMO" ] && [ "$GATE_TMO" -gt "$(( _waits + SOAK ))" ]; then
+    ok "bounded waits + soak fit the gate: ${_waits} + ${SOAK} = $(( _waits + SOAK )) < ${GATE_TMO}s"
+else
+    haz "bounded waits + soak ($(( _waits + SOAK ))s) do not fit the gate timeout (${GATE_TMO}s)" \
+        "a boot that hits every bound is killed by TimeoutStartSec and the boot is condemned for being SLOW, not broken — the one failure mode a rollback cannot distinguish."
+fi
+fi
+
+# 8c. The daemon is the only thing watching the halt line. If it dies at the
+#     wrong moment, the rail is cut on the controller's schedule regardless.
+if [ -n "$DAEMON_RESTART" ] && [ "$(( DAEMON_RESTART + T_SHUTDOWN ))" -lt "$PCD" ]; then
+    ok "daemon restart + shutdown fits the power-cut budget: ${DAEMON_RESTART} + ${T_SHUTDOWN} < ${PCD}s"
+else
+    haz "daemon restart (${DAEMON_RESTART}s) + shutdown (${T_SHUTDOWN}s) does not fit ${PCD}s" \
+        "if the daemon dies just as alarm2 fires, it cannot restart, notice the halt line and shut down before the rail is cut."
+fi
+
+# 8d. The MCU's temperature points vs the sensor's own. Registers 44 and 46
+#     are pushed into the LM75B by initializeRegisters() — at MCU RESET ONLY.
+#     `wittypi configure` writes the MCU's copies and nothing carries the change
+#     onward, so after any event that re-seeds them (a firmware flash wipes
+#     EEPROM) the sensor keeps stale thresholds until the next power cycle.
+#     Detected by diffing a register dump; invisible to every other check. The
+#     firmware forwards exactly one register on write — 37, to the RTC — which
+#     is why the RTC offset never has this problem and these do.
+if [ -n "$MCU_OVERT" ] && [ -n "$LM_TOS" ] && [ -n "$MCU_BELOWT" ] && [ -n "$LM_THYST" ]; then
+    if [ "$MCU_OVERT" = "$LM_TOS" ] && [ "$MCU_BELOWT" = "$LM_THYST" ]; then
+        ok "the LM75B holds the configured thresholds (over $MCU_OVERT, below $(wp_signed_or "$MCU_BELOWT"))"
+    else
+        haz "the LM75B's own thresholds do not match the policy: TOS=$LM_TOS vs reg46=$MCU_OVERT, THYST=$(wp_signed_or "$LM_THYST") vs reg44=$(wp_signed_or "$MCU_BELOWT")" \
+            "configure fixed the MCU's copies; only an MCU RESET pushes them to the sensor. Shutdown still uses the MCU copy in software, so this is bounded — but the sensor's OS/ALARM pin is wrong until the next power cycle."
+    fi
+fi
+
+# 9. timing-terms against the firmware source, when both are reachable.
+#    This is the check that matters when you recompile the controller. The
+#    terms file is the home and the firmware source is the authority; if they
+#    disagree, everything downstream is reasoning about hardware that no longer
+#    exists — and nothing else in the system can notice, because the only thing
+#    readable over I2C is a revision byte the compiler does not bump for you.
+if [ -r "$FW_SRC" ]; then
+    if [ -z "$FW_DRIFT" ]; then
+        ok "timing-terms agrees with the firmware source on every constant"
+    else
+        haz "timing-terms has drifted from the firmware source:$FW_DRIFT" \
+            "update timing-terms, and if the FIRMWARE changed, bump I2C_FW_REVISION too or the revision guard is defeated."
+    fi
+fi
+
+# 10. The terms are only valid for one firmware revision, and the board is the
+#     only thing that can say which one is actually running.
+if [ -n "$FW_REV" ] && [ "$FW_REV" != "$FW_REV_TERM" ]; then
+    haz "controller reports firmware revision $FW_REV; timing-terms describes rev $FW_REV_TERM" \
+        "the alarm window, thermal inhibit and guaranteed-wake unit are all revision-specific. Re-read them from the firmware you actually flashed before trusting this table."
+fi
+
+# ── Things that are true and are not invariants ────────────────────────────
+hdr "OBSERVATIONS — no arithmetic to fail, but they decide behaviour"
+
+note "$(printf 'The %ss alarm window is a COINCIDENCE TEST, not a timeout. The controller\n        computes date*86400 + h*3600 + m*60 + s for both clocks and fires only while\n        0 <= now - alarm < %s, checked at 1 Hz. Miss it and the wake does not happen\n        LATE — it does not happen at all, until guaranteed wake %sh later.' \
+    "$ALARM_WIN" "$ALARM_WIN" "$GW")"
+
+note "$(printf 'Only wittypi rtc-write moves the RTC, so an NTP step (poll %s-%ss) is harmless\n        on its own. It becomes a lost wake when wittypi-rtc-save.path writes a stepped\n        clock through and the jump crosses a pending alarm. A DST conversion would be\n        a 3600s discontinuity against a %ss tolerance — hence UTC everywhere.' \
+    "$NTP_MIN" "$NTP_MAX" "$ALARM_WIN")"
+
+if [ -n "$RB_WD" ] && [ "$RB_WD" -gt "$PCD" ]; then
+    note "$(printf 'RebootWatchdogSec (%ss) can never fire during a controller-initiated shutdown:\n        the rail is cut at %ss. The hard backstop here is the power cut, not systemd.' \
+        "$RB_WD" "$PCD")"
+fi
+
+if [ -n "$SOAK" ] && [ "$T_BOOT" -lt "$SOAK" ]; then
+    note "$(printf 'The soak SUBSUMES the boot (T_boot %ss < soak %ss), so mark-good lands at\n        ~%ss, not %s + %s. Those add only if the boot ever exceeds the soak.' \
+        "$T_BOOT" "$SOAK" "$T_MARKGOOD" "$T_BOOT" "$SOAK")"
+fi
+
+if [ "$MODE" = board ] && [ -n "$DEFAULT_ON" ] && [ "$DEFAULT_ON" != 1 ]; then
+    haz "default-on (reg 17) is $DEFAULT_ON, not 1" \
+        "after a power interruption this node stays dark until someone presses the button. On an unattended node that is a site visit."
+fi
+
+if [ -n "$FW_REV" ]; then
+    note "$(printf 'Register 12 cannot tell you which firmware this is. It reads %s on stock AND\n        on the patched build — the revision is deliberately not bumped (it advertises\n        vendor features, and WP_MIN_REV_GUARANTEED_WAKE keys off it) and no marker\n        fits in the flash. Identify by reading flash back and comparing\n        against firmware/wittypi/build/, which verifies the whole image:\n          avrdude -c usbasp-clone -p t841 -n            # warm-up, the first entry fails\n          avrdude -c usbasp-clone -p t841 -B 32kHz -U flash:r:/tmp/f.bin:r\n        WARNING: That holds RESET, which cuts the Pi. Shut the node down first.' "$FW_REV")"
+fi
+
+if [ "$MODE" = repo ]; then
+    note 'repo mode shows COMPILED defaults — what an unconfigured node gets. The
+        deployed node overrides some of these in /data/wittypi.env, which no build
+        can see. Run this on the node for what is actually running.'
+fi
+
+printf '\n'
+if [ "$hazards" = 0 ]; then
+    printf '%s0 hazards%s, %s notes — every relationship above holds.\n' "$G" "$Z" "$notes"
+    exit 0
+fi
+printf '%s%s hazard(s)%s, %s notes.\n' "$R" "$hazards" "$Z" "$notes"
+exit 1

@@ -1,0 +1,901 @@
+#!/bin/sh
+# Witty Pi 4 bench tool — read the controller, and apply WITTYPI.md's settings.
+#
+# In ${bindir}, not libexec: this is meant to be TYPED by a human at the serial
+# console, which on a board whose recovery is otherwise a site visit is the
+# last way in.
+#
+# `wittypi status` is the first thing to run on the bench, because
+# `revision` decides whether WITTYPI.md's layer 3 exists at all.
+
+set -u
+
+WP_LIB="${WITTYPI_LIB:-/usr/libexec/site/wittypi-lib.sh}"
+# shellcheck source=/dev/null
+. "$WP_LIB"
+
+wp_usage() {
+    cat <<EOF
+usage: wittypi <command> [args]
+
+  status              controller identity, telemetry and capability
+  rtc                 read the proxied PCF85063 clock
+  temp                read the proxied LM75B temperature
+  rtc-sync            set the SYSTEM clock from the RTC
+  rtc-write           set the RTC from the system clock
+  get <reg|NAME>      read one register, by number or by name
+  set <reg|NAME> <v>  write one register
+  regs [--all]        dump the registers this design uses, decoded;
+                      --all adds the proxied RTC and temperature block (50-71)
+  names               list every register name this tool understands
+  check               compare the board against the policy, change nothing
+  configure           apply the policy (WITTYPI.md's register table).
+                      Prefer: systemctl restart wittypi-configure.service —
+                      only the UNIT loads /data/wittypi.env. Run bare, this
+                      applies COMPILED defaults and ignores every site value.
+
+The RTC and the temperature sensor are NOT on the Pi's I2C bus — they sit on
+the MCU's internal bus and are proxied as registers 50-71 of 0x08. That is why
+i2cdetect shows 0x08 alone, why there is no /dev/rtc, and why reading the clock
+is this tool's job rather than the kernel's.
+
+check and configure read the site's values from the environment, because they
+are properties of the installation and not of the image. On the board they
+come from /data/wittypi.env via the unit.
+
+  WITTYPI_TOPOLOGY         usb5v | vin2s | vin3s   — THE one that matters
+  WITTYPI_LOW_VOLTAGE      volts (register 19; vin* only, defaults per topology)
+  WITTYPI_RECOVERY_VOLTAGE volts (register 22; MUST exceed the above, and see
+                           the starvation warning — low is safer than high)
+  WITTYPI_GUARANTEED_WAKE  hours, default $WP_FALLBACK_GUARANTEED_WAKE (49 GUARANTEED_WAKE)
+  WITTYPI_POWER_CUT_DELAY  seconds, default $WP_FALLBACK_POWER_CUT_DELAY (21 POWER_CUT_DELAY)
+  WITTYPI_DEFAULT_ON_DELAY seconds, default $WP_FALLBACK_DEFAULT_ON_DELAY (47 DEFAULT_ON_DELAY;
+                           >32 overflows the firmware and the rail stays down for weeks)
+  WITTYPI_OVER_TEMP        degrees C, default $WP_FALLBACK_OVER_TEMP (46 OVER_TEMP_POINT)
+  WITTYPI_BELOW_TEMP       degrees C, default $WP_FALLBACK_BELOW_TEMP (44 BELOW_TEMP_POINT; MUST be
+                           below the above — the firmware compares the pair)
+  WITTYPI_RTC_OFFSET       PCF85063 calibration byte (37 RTC_OFFSET). PER BOARD —
+                           a firmware flash ERASES it and nothing else restores it.
+                           Read it with \`wittypi get RTC_OFFSET\` BEFORE flashing.
+  WITTYPI_ADJ_VIN          signed hundredths of a volt (24 ADJ_VIN)
+  WITTYPI_ADJ_VOUT         signed hundredths of a volt (25 ADJ_VOUT)
+  WITTYPI_ADJ_IOUT         signed hundredths of an amp (26 ADJ_IOUT)
+
+WITTYPI_TOPOLOGY decides three registers — 19, 22 and 41 — and nothing else.
+It is refused rather than defaulted when unrecognised, because a typo that
+silently left the battery unprotected would look exactly like a working board.
+
+Exit status: 0 in sync / applied · 1 no controller on the bus · 2 the site
+configuration is contradictory, or a register would not take.
+EOF
+}
+
+wp_require() {
+    wp_present || {
+        printf 'no Witty Pi at %s on i2c-%s.\n' "$WP_ADDR" "$WP_BUS" >&2
+        printf 'Check it is fitted, and that i2cdetect -y %s shows 0x08.\n' "$WP_BUS" >&2
+        exit 1
+    }
+}
+
+# Volts -> the register's x10 encoding. Uses integer arithmetic on the decimal
+# string rather than bc, which is not in this image.
+#
+# Both halves go through wp_dec10 for the same reason wp_dec2bcd does: a site
+# that writes its cutoff as "09.6" — which is exactly how a 3S LiFePO4 pack's
+# nominal reads if anyone pads it — would otherwise hit the octal trap and
+# configure the low-voltage threshold to nothing.
+wp_volts_to_reg() {
+    wp_vtr_int=$(wp_dec10 "${1%%.*}")
+    wp_vtr_frac=${1#*.}
+    if [ "$wp_vtr_frac" = "$1" ]; then
+        wp_vtr_frac=0
+    else
+        wp_vtr_frac=$(wp_dec10 "$(printf '%.1s' "$wp_vtr_frac")")
+    fi
+    echo $(( wp_vtr_int * 10 + wp_vtr_frac ))
+}
+
+# Signed hundredths -> the register's byte encoding. ADJ_VIN/ADJ_VOUT/ADJ_IOUT
+# are read back by the firmware as (char), so -5 is stored as 251.
+wp_signed_byte() {
+    wp_sb_mag=$(wp_dec10 "${1#-}")
+    if [ "$wp_sb_mag" -gt 127 ]; then
+        printf 'REFUSING: trim %s is outside the register range (-127..127).\n' "$1" >&2
+        exit 2
+    fi
+    case "$1" in
+        -*) echo $(( 256 - wp_sb_mag )) ;;
+        *)  echo "$wp_sb_mag" ;;
+    esac
+}
+
+# ── THE POLICY ─────────────────────────────────────────────────────────────
+# WITTYPI.md's register table, as data: one "reg<TAB>value<TAB>label" line per
+# row. `configure` writes it and `check` compares against it, so the two cannot
+# drift apart into disagreeing about what the policy IS.
+#
+# `check` exists precisely because a register-by-register read can find a
+# board holding most of its specified rows unapplied while still looking
+# fine at a glance — some rows are "right" only because they happen to also
+# be the factory default, so "applied" and "never touched" are otherwise
+# indistinguishable.
+#
+# CALL IT AS `wp_pol=$(wp_policy) || exit $?`. A contradiction exits 2 from the
+# subshell and the assignment carries that status out. Do NOT put it in a
+# pipeline — the exit would be swallowed and the caller would sail on with an
+# empty policy, which is precisely the "silently configures nothing" failure
+# this whole file is trying not to have.
+WP_TAB=$(printf '\t')
+
+# ── The site defaults live here, once ──────────────────────────────────────
+# They used to be written inline as ${VAR:-N} at the point of use AND typed
+# again into the usage text, and the two can drift exactly as you'd expect —
+# help text advertising a stale default is worse than no help text at all,
+# because it's what someone reaches for when they're already unsure.
+#
+# The usage text INTERPOLATES these, so the two cannot disagree.
+#
+# Named WP_FALLBACK_ rather than WP_DEF_: WP_DEF_POWER_CUT_DELAY sits one
+# letter from WP_REG_POWER_CUT_DELAY, and those two are a VALUE (seconds)
+# and a REGISTER NUMBER respectively — swapping them silently writes the
+# wrong deci-second count into the wrong register. shellcheck flags the
+# resemblance (SC2153) before a human catches it, which is reason enough to
+# avoid the collision in the first place.
+WP_FALLBACK_GUARANTEED_WAKE=26      # hours; must exceed the duty cycle
+# Raised to the register ceiling (25) rather than a smaller value because
+# the shutdown path shares this one budget across everything that has to
+# happen after a shutdown request: any pre-shutdown gate's wait, an optional
+# notification, and Linux actually shutting down. A budget with only a few
+# seconds of slack against a real shutdown means a shutdown running
+# moderately over its measured time gets cut mid-write, on the one path
+# where persistent storage is being unmounted.
+#
+# 25 is not a preference, it's WP_MAX_POWER_CUT_DELAY: register 21 is
+# deci-seconds in one byte and 255 is the never-written sentinel, so 254 ->
+# 25.4 is the ceiling and 25 the usable value — there is no more where this
+# came from. The cost is a few more seconds of the rail being up per cycle,
+# on a board that sleeps for hours; the benefit is real margin against a
+# shutdown-duration estimate being wrong.
+WP_FALLBACK_POWER_CUT_DELAY=25      # seconds; see WP_MAX_POWER_CUT_DELAY
+WP_FALLBACK_DEFAULT_ON_DELAY=10     # seconds; >32 overflows the firmware's int16
+WP_FALLBACK_OVER_TEMP=70            # degrees C
+WP_FALLBACK_BELOW_TEMP=-20          # degrees C
+
+wp_emit() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
+
+wp_policy() {
+    wp_p_lv=''; wp_p_rv=''; wp_p_full=''
+
+    # ── The topology decides three registers, and only these three ─────────
+    case "${WITTYPI_TOPOLOGY:-}" in
+    usb5v)
+        # POWER_MODE reads 0 on a USB-C feed, and WittyPi4.ino:962 gates the
+        # entire low-voltage path on mode 1 — so 19 and 22 do nothing. They are
+        # written as 255 (explicitly disabled) rather than left holding some
+        # number that reads like protection to the next person.
+        if [ -n "${WITTYPI_LOW_VOLTAGE:-}${WITTYPI_RECOVERY_VOLTAGE:-}" ]; then
+            printf 'REFUSING: topology usb5v with a voltage threshold set.\n' >&2
+            printf 'On a 5V USB-C feed the controller reads POWER_MODE 0 and the whole\n' >&2
+            printf 'low-voltage path is inert; the ADC also watches the REGULATED 5V rail\n' >&2
+            printf 'rather than the pack, so the number would carry no charge state even\n' >&2
+            printf 'if it were consulted. Writing it configures nothing while reading as\n' >&2
+            printf 'protection. On this topology the battery belongs to the charger board.\n' >&2
+            exit 2
+        fi
+        wp_p_lv=$WP_EEPROM_UNSET; wp_p_rv=$WP_EEPROM_UNSET
+        ;;
+    vin2s)
+        wp_p_lv=$(wp_volts_to_reg "${WITTYPI_LOW_VOLTAGE:-6.6}")
+        wp_p_rv=$(wp_volts_to_reg "${WITTYPI_RECOVERY_VOLTAGE:-7.0}")
+        wp_p_full=84
+        printf 'WARNING: topology vin2s, and the DC/DC dropout is UNMEASURED.\n' >&2
+        printf 'A 2S pack spans 6.0-8.4V against a board specified from 6V, so the usable\n' >&2
+        printf 'window sits on the floor. The MP4462 itself runs from 3.8V, so that 6V\n' >&2
+        printf 'limit is something added around it — plausibly an EN divider, and MPS\n' >&2
+        printf 'recommend programming that UVLO to Vout+3V, which for 5V out is 8V. If the\n' >&2
+        printf 'board followed that note, a 2S pack browns out almost immediately. Put a\n' >&2
+        printf 'bench supply on the XH2.54 input and find where Vout collapses.\n' >&2
+        ;;
+    vin3s)
+        wp_p_lv=$(wp_volts_to_reg "${WITTYPI_LOW_VOLTAGE:-9.6}")
+        wp_p_rv=$(wp_volts_to_reg "${WITTYPI_RECOVERY_VOLTAGE:-10.2}")
+        wp_p_full=126
+        ;;
+    '')
+        # ── Unset is not uniformly safe, and the board knows which case it is ─
+        # On a 5 V feed registers 19/22 are inert — WittyPi4.ino:962 gates the
+        # entire low-voltage path on POWER_MODE 1 — so leaving them alone costs
+        # nothing. On VIN they ARE the battery protection, and leaving them at
+        # whatever the EEPROM happens to hold is precisely the failure this
+        # file refuses to make everywhere else: something that reads as
+        # protection and protects nothing.
+        #
+        # A single warning covering both cases is not enough: it's easy for a
+        # bench board with no site config at all to run for a long time on
+        # the harmless (USB-C) side of that warning without anyone reading
+        # the journal, which teaches the wrong lesson about how safe leaving
+        # this unset actually is.
+        #
+        # So discriminate on the register rather than hoping someone reads a
+        # log. The board can tell us which topology it is actually in; asking
+        # it is free.
+        wp_p_mode=$(wp_get "$WP_REG_POWER_MODE") || wp_p_mode=0
+        if [ "$wp_p_mode" = "1" ]; then
+            printf 'REFUSING: WITTYPI_TOPOLOGY is unset, and the board reports register %s\n' \
+                "$WP_REG_POWER_MODE" >&2
+            printf '= 1 — it is running from the DC/DC (VIN) input, off a pack.\n' >&2
+            printf 'On that topology registers %s and %s ARE the battery protection, and\n' \
+                "$WP_REG_LOW_VOLTAGE" "$WP_REG_RECOVERY_VOLTAGE" >&2
+            printf 'applying a policy that skips them would leave whatever the EEPROM\n' >&2
+            printf 'happens to hold standing in for a cutoff — a board that looks configured\n' >&2
+            printf 'and protects nothing, until the pack is flat.\n' >&2
+            printf 'Set WITTYPI_TOPOLOGY=vin2s or vin3s in /data/wittypi.env.\n' >&2
+            exit 2
+        fi
+        printf 'WARNING: WITTYPI_TOPOLOGY unset — skipping registers %s and %s.\n' \
+            "$WP_REG_LOW_VOLTAGE" "$WP_REG_RECOVERY_VOLTAGE" >&2
+        printf 'The board reports register %s = 0 (5V USB-C), where those two are inert,\n' \
+            "$WP_REG_POWER_MODE" >&2
+        printf 'so this is survivable — but they are then at whatever the EEPROM holds,\n' >&2
+        printf 'and "factory default" is indistinguishable from "deliberately disabled".\n' >&2
+        printf 'Set WITTYPI_TOPOLOGY=usb5v in /data/wittypi.env to say which you meant.\n' >&2
+        ;;
+    *)
+        printf 'REFUSING: WITTYPI_TOPOLOGY="%s" is not a topology.\n' \
+            "$WITTYPI_TOPOLOGY" >&2
+        printf 'Valid: usb5v (5V into USB-C), vin2s, vin3s (a pack on the XH2.54 input).\n' >&2
+        printf 'This is refused rather than defaulted because a typo that quietly left\n' >&2
+        printf 'the battery unprotected would look exactly like a working board — until\n' >&2
+        printf 'the battery died.\n' >&2
+        exit 2
+        ;;
+    esac
+
+    if [ -n "$wp_p_lv" ]; then
+        # Hysteresis must be the right way round or the board oscillates: below
+        # 19 it shuts down, above 22 it comes back, so 22 <= 19 lets it wake
+        # into an immediate shutdown forever. Both-disabled is exempt.
+        if [ "$wp_p_lv" != "$WP_EEPROM_UNSET" ] && [ "$wp_p_rv" -le "$wp_p_lv" ]; then
+            printf 'REFUSING: recovery voltage (%s) must EXCEED low voltage (%s),\n' \
+                "$wp_p_rv" "$wp_p_lv" >&2
+            printf 'or the board oscillates between shutdown and wake.\n' >&2
+            exit 2
+        fi
+        # ── And it must not be set HIGH, which is the counter-intuitive half ─
+        # On VIN, guaranteed wake is gated on the RECOVERY voltage, and a failed
+        # check zeroes the counter rather than retrying (WittyPi4.ino:363-372) —
+        # so it postpones by another whole period. A recovery threshold near the
+        # pack's float can therefore starve layer 3 for a long time, at exactly
+        # the moment it is the only defence left standing.
+        if [ -n "$wp_p_full" ] && [ "$wp_p_rv" -ge "$(( wp_p_full - 5 ))" ]; then
+            printf 'WARNING: recovery voltage %s is within 0.5V of a full pack (%s).\n' \
+                "$wp_p_rv" "$wp_p_full" >&2
+            printf 'Guaranteed wake is gated on this threshold and RESETS its counter when\n' >&2
+            printf 'the check fails, so setting it high can starve layer 3 indefinitely.\n' >&2
+            printf 'Prefer a value just above the low-voltage cutoff.\n' >&2
+        fi
+        wp_emit "$WP_REG_LOW_VOLTAGE"      "$wp_p_lv" 'low voltage (x10 V)'
+        wp_emit "$WP_REG_RECOVERY_VOLTAGE" "$wp_p_rv" 'recovery voltage (x10 V)'
+    fi
+
+    # 41: there is no configuration in this design where 1 is correct. On usb5v
+    # it would force a useless threshold onto a regulated rail; on vin* the
+    # board is already in mode 1 and does not need it.
+    wp_emit "$WP_REG_IGNORE_POWER_MODE" 0 'ignore power mode'
+
+    # ── Topology-independent from here down ────────────────────────────────
+    wp_emit "$WP_REG_DEFAULT_ON" 1 'default-on after a power interruption'
+
+    # ── This register has an upper bound of 32, easy to miss ───────────────
+    # The firmware (WittyPi4.ino:253) does:
+    #
+    #     delay(i2cReg[I2C_CONF_DEFAULT_ON_DELAY] * 1000);
+    #
+    # `int` is 16 BITS on AVR, so that product is evaluated as an int and only
+    # then widened to delay()'s unsigned long. Anything above 32 overflows:
+    #
+    #     reg  32 ->     32000 ms =  32 s      the largest that works
+    #     reg  33 -> -32536 as int16 -> 4294934760 ms ~ 49.7 DAYS
+    #     reg 254 ->  -8144 as int16 -> 4294959152 ms ~ 49.7 DAYS
+    #
+    # so DEFAULT_ON never fires and the only ways back are the button, alarm1
+    # or guaranteed wake. This has caused a real outage this way: input power
+    # pulled and reinserted, board never came back, dark until the button was
+    # pressed. **The vendor's own tool caps this at 0-10**
+    # (`wittyPi.sh:380`: "Wait how many seconds before Auto-ON (0~10)"), which
+    # is corroboration that nothing above single digits was ever intended.
+    #
+    # The lesson worth keeping in mind if you're tuning this yourself: it's
+    # easy to reason carefully about the value 255 being the EEPROM
+    # "never-written" sentinel, pick the largest number that avoids it, and
+    # never ask whether there's an upper bound for a completely different
+    # reason. One end of a range gets all the scrutiny and the other gets
+    # none.
+    #
+    # 10 is the vendor's documented maximum, and the "soften a brownout"
+    # intent this delay was chosen for is NOT achievable here at any legal
+    # value — 32 s does not meaningfully protect a flat pack. That job
+    # belongs to the charger board's LVD (WITTYPI-SETTINGS.md §4.1), which is
+    # the only thing on this topology that consults the battery at all.
+    #
+    # 255 remains separately refused: the MCU reads a stored 255 as "never
+    # written" and replaces it with the compiled default (0 for this register),
+    # so the value would survive only until the next power loss — the exact
+    # event it exists for.
+    wp_p_don=$(wp_dec10 "${WITTYPI_DEFAULT_ON_DELAY:-$WP_FALLBACK_DEFAULT_ON_DELAY}")
+    if [ "$wp_p_don" -ge "$WP_EEPROM_UNSET" ]; then
+        printf 'REFUSING: default-on delay %s cannot be stored in register %s.\n' \
+            "$wp_p_don" "$WP_REG_DEFAULT_ON_DELAY" >&2
+        printf 'The MCU treats a stored 255 as "never written" and overwrites it with the\n' >&2
+        printf 'compiled default (0 for this register), so the value would survive only\n' >&2
+        printf 'until the next power loss — the exact event it is meant to soften.\n' >&2
+        exit 2
+    fi
+    if [ "$wp_p_don" -gt "$WP_MAX_DEFAULT_ON_DELAY" ]; then
+        printf 'REFUSING: default-on delay %s overflows the firmware.\n' "$wp_p_don" >&2
+        printf 'WittyPi4.ino:253 computes delay(reg * 1000) in a 16-bit int, so any value\n' >&2
+        printf 'above %s wraps negative and becomes ~49.7 DAYS as an unsigned long.\n' \
+            "$WP_MAX_DEFAULT_ON_DELAY" >&2
+        printf 'DEFAULT_ON then never fires: input power returns and the board stays dark,\n' >&2
+        printf 'recoverable only by the button, alarm1 or guaranteed wake. This is not\n' >&2
+        printf 'theoretical — a value this large has caused a real outage this way.\n' >&2
+        printf 'The vendor caps it at 0-10; use 10.\n' >&2
+        exit 2
+    fi
+    wp_emit "$WP_REG_DEFAULT_ON_DELAY" "$wp_p_don" 'default-on delay (s)'
+    wp_emit "$WP_REG_BLINK_LED" 0 'white LED while asleep (ms)'
+    wp_emit "$WP_REG_DUMMY_LOAD" 0 'dummy load while asleep (ms)'
+    wp_emit "$WP_REG_POWER_CUT_DELAY" \
+        "$(( $(wp_dec10 "${WITTYPI_POWER_CUT_DELAY:-$WP_FALLBACK_POWER_CUT_DELAY}") * 10 ))" 'power-cut delay (x10 s)'
+    wp_emit "$WP_REG_OVER_TEMP_ACTION" 1 'over-temperature action (1 = shutdown)'
+    wp_emit "$WP_REG_OVER_TEMP_POINT" \
+        "$(wp_dec10 "${WITTYPI_OVER_TEMP:-$WP_FALLBACK_OVER_TEMP}")" 'over-temperature point (C)'
+    wp_emit "$WP_REG_BELOW_TEMP_ACTION" 0 'below-temperature action (0 = nothing)'
+
+    # ── 44 is policy now, and owning one of a pair is what breaks it ────────
+    # The firmware compares 44 and 46 against each other. A policy that sets
+    # 46 and says nothing about 44 can invert the pair against whatever 44
+    # happens to hold — one register away from a board requesting shutdown
+    # shortly after every boot, which can be shorter than a health-check
+    # soak and cost a boot attempt on both slots of an A/B system.
+    #
+    # A board that had this happen to it required a manual repair that lived
+    # nowhere in version control, so a replacement Witty Pi would have
+    # arrived at the factory value and reproduced the same inversion.
+    # wp_sanity refuses half a pair, which is why wiring that check in
+    # (below) and adopting this row are the same change: the check fails a
+    # policy that omits this row.
+    #
+    # -20C, not 0C: it makes the register mean what its name says, keeps the
+    # LM75B's THYST < TOS valid, and is safe if the below-temperature ACTION is
+    # ever enabled. Assigned before emitting because wp_signed_byte refuses
+    # out-of-range by exiting, and an exit inside $(...) leaves only the inner
+    # subshell — the same trap the ADJ_* rows document.
+    wp_p_btp=$(wp_signed_byte "${WITTYPI_BELOW_TEMP:-$WP_FALLBACK_BELOW_TEMP}") || exit $?
+    wp_emit "$WP_REG_BELOW_TEMP_POINT" "$wp_p_btp" 'below-temperature point (C)'
+
+    wp_emit "$WP_REG_MISC" 0 'misc (alarm1 delay enabled)'
+
+    # ── The RTC's OWN control register, proxied at 54 ──────────────────────
+    # 0 = 24-hour mode, 7pF crystal cap, nothing stopped — the power-on
+    # default, and the only value every decoder in this system can live
+    # with. This register has been observed nonzero on real hardware: bit 1
+    # (12/24) flipped, plausibly torn-frame debris on the ATtiny's
+    # once-per-second internal bus transaction under physical vibration —
+    # while the RTC kept perfect time in an encoding everything downstream
+    # (the MCU's own alarm match included) reads as garbage: noon decoding
+    # as "hour 32", midnight as +12h, armed alarms that could never fire. A
+    # full power removal heals it by POR, which is why this row — reapplied
+    # every boot — is what heals it the rest of the time.
+    wp_emit "$WP_REG_RTC_CTRL1" 0 'RTC Control_1 (24h mode, defaults)'
+
+    # Layer 3, and only where the firmware implements it. A setting that
+    # silently does nothing is worse than an error.
+    if wp_has_guaranteed_wake; then
+        # ── 26, not 24, and the difference is the whole point ──────────────
+        # guaranteedWakeCounter resets on every powerOn() (WittyPi4.ino:449),
+        # so layer 3 expires that long after the LAST power-on. Set equal to
+        # a once-daily duty cycle, it would expire at the same instant as
+        # alarm1 — the backstop racing the wake it exists to back up, with
+        # the action-reason register unable to say which of them brought the
+        # board up.
+        #
+        # A couple of hours of margin never expires on a shorter sleep and
+        # recovers a missed wake soon after. Register 49 is in HOURS
+        # (threshold * 3600), so 1 h is the shortest backstop expressible at
+        # all.
+        #
+        # This is a function of the LONGEST INTENDED SLEEP — revisit it if
+        # the schedule ever sleeps longer than about a day.
+        wp_emit "$WP_REG_GUARANTEED_WAKE" \
+            "$(wp_dec10 "${WITTYPI_GUARANTEED_WAKE:-$WP_FALLBACK_GUARANTEED_WAKE}")" 'guaranteed wake (h)'
+    else
+        printf 'WARNING: firmware predates guaranteed wake; register %s left alone.\n' \
+            "$WP_REG_GUARANTEED_WAKE" >&2
+    fi
+
+    # Calibration is per-board, so it is only policy once a site has measured
+    # it. Unset means "do not touch", not "zero".
+    #
+    # Assigned first and THEN emitted: wp_signed_byte refuses an out-of-range
+    # trim by exiting, and an exit inside $(...) only leaves that inner
+    # subshell — inlined, the refusal would be swallowed and the register
+    # written with an empty value. Same trap as the note on wp_policy itself.
+    # ── RTC offset — the one value a firmware flash destroys forever ───────
+    # Register 37 is the PCF85063's calibration offset, and it is unlike every
+    # other register here in two ways that together make it dangerous:
+    #
+    #   * initializeRegisters() does NOT seed it, so an erased EEPROM leaves it
+    #     zero-initialised rather than at some sane factory value;
+    #   * it is PER BOARD. It is a measured property of one crystal, so there
+    #     is no default this image could carry that would be right anywhere.
+    #
+    # UUGear's own flashing instructions say plainly "we will erase the data in
+    # EEPROM" and tell you to back this up by hand and write it back with
+    # i2cset afterwards. A hand step performed once, on a board that then runs
+    # for years, is a hand step that will be forgotten — and the symptom is a
+    # clock that drifts, which is exactly what this board was chosen to avoid.
+    #
+    # So it is policy, applied every boot like everything else, and site
+    # config rather than an image default because it belongs to the
+    # hardware — the value lives in /data/wittypi.env, not here.
+    if [ -n "${WITTYPI_RTC_OFFSET:-}" ]; then
+        wp_p_rtco=$(wp_dec10 "$WITTYPI_RTC_OFFSET") || exit $?
+        if [ "$wp_p_rtco" -lt 0 ] || [ "$wp_p_rtco" -gt 255 ]; then
+            printf 'REFUSING: RTC offset %s is not a byte.\n' "$wp_p_rtco" >&2
+            exit 2
+        fi
+        wp_emit "$WP_REG_RTC_OFFSET" "$wp_p_rtco" 'RTC calibration offset (per board)'
+    fi
+
+    if [ -n "${WITTYPI_ADJ_VIN:-}" ]; then
+        wp_p_adjv=$(wp_signed_byte "$WITTYPI_ADJ_VIN") || exit $?
+        wp_emit "$WP_REG_ADJ_VIN" "$wp_p_adjv" 'Vin trim (x100)'
+    fi
+    # Register 25 (ADJ_VOUT) is easy to leave out of a policy by accident:
+    # the firmware seeds 24 and 25 to the same non-zero default while
+    # leaving 26 at zero, so an uncalibrated board looks identical whether
+    # or not 25 is covered by policy. The gap only becomes visible once
+    # someone calibrates Vout — 24 and 26 get reapplied at every boot and 25
+    # silently reverts to the firmware default after any EEPROM erase. A
+    # calibration that survives on two axes and not the third is worse than
+    # none, because the disagreement then looks like drift in the hardware
+    # rather than a config gap.
+    if [ -n "${WITTYPI_ADJ_VOUT:-}" ]; then
+        wp_p_adjvo=$(wp_signed_byte "$WITTYPI_ADJ_VOUT") || exit $?
+        wp_emit "$WP_REG_ADJ_VOUT" "$wp_p_adjvo" 'Vout trim (x100)'
+    fi
+
+    if [ -n "${WITTYPI_ADJ_IOUT:-}" ]; then
+        wp_p_adji=$(wp_signed_byte "$WITTYPI_ADJ_IOUT") || exit $?
+        wp_emit "$WP_REG_ADJ_IOUT" "$wp_p_adji" 'Iout trim (x100)'
+    fi
+    return 0
+}
+
+case "${1:-}" in
+status)
+    wp_require
+    printf 'firmware id       0x%02x\n' "$(wp_get "$WP_REG_ID")"
+    wp_rev=$(wp_get "$WP_REG_FW_REVISION")
+    printf 'firmware revision %s\n' "$wp_rev"
+    if [ "$wp_rev" -ge "$WP_MIN_REV_GUARANTEED_WAKE" ]; then
+        printf 'guaranteed wake   available (WITTYPI.md layer 3 is usable)\n'
+    else
+        printf 'guaranteed wake   NOT AVAILABLE — needs revision %s.\n' \
+            "$WP_MIN_REV_GUARANTEED_WAKE"
+        printf '                  This board has TWO rollback defences, not three.\n'
+    fi
+    printf 'last action       reason %s\n' "$(wp_get "$WP_REG_ACTION_REASON")"
+    printf 'power mode        %s\n' \
+        "$([ "$(wp_get "$WP_REG_POWER_MODE")" = "1" ] && echo 'VIN (DC/DC)' || echo '5V USB-C')"
+    printf 'Vin               %sV\n'  "$(wp_read_pair "$WP_REG_VIN_INT"  "$WP_REG_VIN_DEC")"
+    printf 'Vout              %sV\n'  "$(wp_read_pair "$WP_REG_VOUT_INT" "$WP_REG_VOUT_DEC")"
+    printf 'Iout              %sA'    "$(wp_read_pair "$WP_REG_IOUT_INT" "$WP_REG_IOUT_DEC")"
+    # A Pi Zero W running Linux draws ~120-150 mA. Anything far below that is
+    # the sensor, not the board — say so here rather than let the number be
+    # copied into a power budget. Register 26 (ADJ_IOUT) is the trim.
+    wp_ii=$(wp_get "$WP_REG_IOUT_INT"); wp_id=$(wp_get "$WP_REG_IOUT_DEC")
+    if [ "$wp_ii" -eq 0 ] && [ "$wp_id" -lt 8 ]; then
+        printf '   implausibly low for a running Pi — see reg 26 ADJ_IOUT'
+    fi
+    printf '\n'
+    printf 'RTC               %s\n'   "$(wp_rtc_read || printf ' (lost power)')"
+    printf 'temperature       %s°C\n' "$(wp_temp_c || echo '?')"
+    ;;
+
+rtc)
+    wp_require
+    # wp_rtc_read_confirmed fails for THREE different reasons now, and saying
+    # "year reads 00" for all of them would send someone to the coin cell when
+    # the real fault was a glitched read or a torn timestamp. It logs the
+    # specific complaint to stderr; distinguish here on what it managed to
+    # print. Confirmed (not raw wp_rtc_read) because callers that schedule a
+    # real alarm from this value need the same protection — see
+    # wp_rtc_read_confirmed's header for exactly what that does and does not
+    # protect against.
+    if wp_t=$(wp_rtc_read_confirmed); then
+        printf '%s\n' "$wp_t"
+    elif [ -n "$wp_t" ]; then
+        printf '%s  year reads 00 — the RTC has lost power and is at its\n' "$wp_t"
+        printf '                       epoch. Do NOT sync the system clock from it.\n'
+        exit 1
+    else
+        printf 'the RTC could not be read reliably — see the message above.\n' >&2
+        printf '   Either a field was out of range (a failed I2C read returns 0xFF,\n' >&2
+        printf '   which decodes to 165), the read kept straddling a tick, or no two\n' >&2
+        printf '   consecutive reads agreed.\n' >&2
+        exit 1
+    fi
+    ;;
+
+temp)
+    wp_require
+    wp_c=$(wp_temp_c) || { echo "could not read the temperature register" >&2; exit 1; }
+    printf '%s°C\n' "$wp_c"
+    ;;
+
+rtc-sync)
+    # RTC -> system. This is the board's only source of time before the
+    # network is up: there is no /dev/rtc for systemd to use, so nothing does
+    # this automatically.
+    wp_require
+    # ── Name the cause that actually happened ──────────────────────────────
+    # A version of this used to say "it has lost power" for EVERY failure,
+    # including when the real fault was a torn read (wp_rtc_read straddling
+    # a tick) rather than a flat coin cell — with an empty value printed
+    # alongside a message that referenced it, i.e. wrong AND blank. The two
+    # causes have completely different fixes — fit a coin cell, versus chase
+    # an I2C timing problem — and a confident wrong diagnosis sends someone
+    # to the wrong one.
+    #
+    # Distinguish on the same evidence the `rtc` subcommand uses: a value
+    # printed with a year of 00 is a lost cell, no value at all is a read
+    # that could not be trusted.
+    #
+    # Confirmed, not raw — this is the one read the whole power-on schedule
+    # hangs off. wp_rtc_read_confirmed requires two consecutive reads to
+    # agree before this sets the system clock, which is what every wake this
+    # boot computes is computed FROM. See its header for what that does and
+    # does not protect against — it is not a fix for a consistently wrong
+    # RTC.
+    if ! wp_t=$(wp_rtc_read_confirmed); then
+        if [ -n "$wp_t" ]; then
+            echo "REFUSING: the RTC reads $wp_t — it has lost power (year 00)." >&2
+            echo "Setting the system clock from it would move the board to 2000." >&2
+            echo "Fit the CR2032; see WITTYPI.md." >&2
+        else
+            echo "REFUSING: the RTC could not be read reliably — see the message above." >&2
+            echo "This is NOT a flat coin cell: no timestamp was produced at all." >&2
+            echo "Either a field was out of range (a failed I2C read returns 0xFF," >&2
+            echo "which decodes to 165), the read kept straddling a tick, or no two" >&2
+            echo "consecutive reads agreed." >&2
+        fi
+        exit 1
+    fi
+    # ── Only ever forward ───────────────────────────────────────────────────
+    # Also worth guarding against: a board can reach this point with the
+    # system clock already holding a *better* time than the RTC — for
+    # example recovered from a persisted NTP timestamp on disk — in which
+    # case setting the clock from a stale RTC would drag it backwards.
+    # Moving the clock backwards is the wrong direction on a board whose
+    # wake schedule is computed from it: it makes an alarm fire late or not
+    # at all, and every later timestamp is then wrong too.
+    #
+    # The RTC is authoritative only over a clock that knows LESS than it
+    # does. Both plausible sources here — the RTC and a persisted timesync
+    # file — only ever hold a time the board has actually seen, so the
+    # later of the two is the better one. Same principle systemd's own
+    # clock_apply_epoch uses: advance, never retreat.
+    wp_rtc_epoch=$(date -u -d "$wp_t" +%s 2>/dev/null || echo '')
+    wp_now_epoch=$(date -u +%s 2>/dev/null || echo '')
+    if [ -n "$wp_rtc_epoch" ] && [ -n "$wp_now_epoch" ] && \
+       [ "$wp_rtc_epoch" -le "$wp_now_epoch" ]; then
+        printf 'RTC reads %s, which is NOT later than the current clock (%s).\n' \
+            "$wp_t" "$(date -u '+%Y-%m-%d %H:%M:%S')"
+        printf 'Leaving the clock alone — an RTC must not move it backwards.\n'
+        exit 0
+    fi
+
+    if date -s "$wp_t" >/dev/null 2>&1; then
+        printf 'system clock set from RTC: %s\n' "$wp_t"
+    else
+        echo "date -s rejected '$wp_t'" >&2
+        exit 1
+    fi
+    ;;
+
+rtc-write)
+    # system -> RTC. Run this once the clock is known good (after NTP), so the
+    # board keeps the time across a power cut.
+    #
+    # ── Every field is read back and compared, not merely printed ──────────
+    # A version of this used to print the read-back and exit 0 regardless,
+    # which let a real corruption through in silence: a date-formatting
+    # octal-literal trap (see wp_dec10's header) on a zero-padded month like
+    # "08" wrote nothing, and the board reported a successful write above an
+    # impossible date it had just produced. A check whose result is
+    # discarded is not a check.
+    #
+    # SECONDS ARE WRITTEN FIRST, and deliberately. The RTC keeps ticking while
+    # the remaining five registers are written, so a cascade could carry into
+    # the minute between writing a field and verifying it. Setting seconds first
+    # puts the next cascade up to a minute away, which makes the strict
+    # comparisons below race-free in practice; seconds itself is then the only
+    # field that may legitimately have advanced, and is checked loosely.
+    wp_require
+
+    # ── Refuse to persist a clock the board does not actually have ─────────
+    # A version of this has actually run this way: on a first boot, with
+    # network time not yet synchronized, it wrote systemd's compiled-in
+    # floor into the RTC and reported "all fields verified", exit 0. The
+    # unit-level fix is to gate on a concrete sync-marker file rather than a
+    # passive target (see wittypi-rtc-save.service); this is the second line
+    # of defence, the one that matters for a human at the console — typing
+    # this command on a board that hasn't synced is exactly as damaging as
+    # the unit doing it automatically.
+    #
+    # Why this is worse than not writing: a board whose RTC holds the floor
+    # comes up confidently wrong. The "year reads 00" tell that says the
+    # coin cell is flat is destroyed, and every later read looks like a
+    # working clock.
+    #
+    # The floor is the image's own build epoch, carried as CONTENT (mkfs
+    # restamps every inode, so an mtime would fall back to some fixed build
+    # date). An image cannot legitimately be running before it was built.
+    wp_epoch_file="${BUILD_EPOCH_FILE:-/usr/lib/site/build-epoch}"
+    if [ -r "$wp_epoch_file" ]; then
+        wp_floor=$(head -n 1 "$wp_epoch_file" 2>/dev/null | tr -dc '0-9')
+        wp_now=$(date -u +%s 2>/dev/null)
+        if [ -n "$wp_floor" ] && [ -n "$wp_now" ] && [ "$wp_now" -lt "$wp_floor" ]; then
+            echo "REFUSING: the system clock reads $(date -u '+%Y-%m-%d %H:%M:%SZ')," >&2
+            echo "which is BEFORE this image was built. It has not been set —" >&2
+            echo "no RTC was read and NTP has not synced." >&2
+            echo "Writing it to the RTC would persist the floor and destroy the" >&2
+            echo "only signal that says the coin cell is flat." >&2
+            echo "Override with WITTYPI_FORCE_RTC_WRITE=1 if you really mean it." >&2
+            [ "${WITTYPI_FORCE_RTC_WRITE:-0}" = "1" ] || exit 1
+            echo "WITTYPI_FORCE_RTC_WRITE=1 — writing anyway." >&2
+        fi
+    fi
+    wp_now=$(date -u '+%y %m %d %H %M %S') || exit 1
+    # shellcheck disable=SC2086
+    set -- $wp_now
+
+    wp_rc=0
+
+    # wp_wr_field <register> <decimal value> <label>
+    wp_wr_field() {
+        wp_wf_want=$(wp_dec10 "$2")
+        wp_set "$1" "$(wp_dec2bcd "$2")"
+        wp_wf_got=$(wp_bcd2dec "$(wp_get "$1")")
+        if [ "$wp_wf_got" != "$wp_wf_want" ]; then
+            printf 'FAILED: %s — wrote %s to register %s, reads back %s\n' \
+                "$3" "$wp_wf_want" "$1" "$wp_wf_got" >&2
+            wp_rc=1
+        fi
+    }
+
+    # Seconds first — see the note above. The mask drops the oscillator-stop
+    # flag, which the RTC may still be asserting from its own power loss.
+    wp_wr_want_sec=$(wp_dec10 "$6")
+    wp_set "$WP_REG_RTC_SEC" "$(wp_dec2bcd "$6")"
+    wp_wr_got_sec=$(wp_bcd2dec $(( $(wp_get "$WP_REG_RTC_SEC") & 0x7F )))
+    if [ "$wp_wr_got_sec" -lt "$wp_wr_want_sec" ] || \
+       [ "$wp_wr_got_sec" -gt "$(( wp_wr_want_sec + 2 ))" ]; then
+        printf 'FAILED: seconds — wrote %s to register %s, reads back %s\n' \
+            "$wp_wr_want_sec" "$WP_REG_RTC_SEC" "$wp_wr_got_sec" >&2
+        wp_rc=1
+    fi
+
+    wp_wr_field "$WP_REG_RTC_MIN"   "$5" minutes
+    wp_wr_field "$WP_REG_RTC_HOUR"  "$4" hours
+    wp_wr_field "$WP_REG_RTC_DAY"   "$3" day
+    wp_wr_field "$WP_REG_RTC_MONTH" "$2" month
+    wp_wr_field "$WP_REG_RTC_YEAR"  "$1" year
+
+    if [ "$wp_rc" -ne 0 ]; then
+        printf 'RTC WRITE FAILED — reads back %s\n' "$(wp_rtc_read)" >&2
+        printf 'The clock this board falls back on across a power cut is WRONG.\n' >&2
+        exit 1
+    fi
+    printf 'RTC set from system clock (UTC), all fields verified: %s\n' \
+        "$(wp_rtc_read)"
+    ;;
+
+get)
+    wp_require
+    [ $# -eq 2 ] || { wp_usage; exit 1; }
+    wp_r=$(wp_reg_num "$2") || exit 2
+    # wp_get_maybe_stable: outvotes a one-off glitch (the same 0x00-then-0x01
+    # register-17 misread wp-lib.sh documents) on any register that only
+    # changes when written; falls back to a plain read for the handful that
+    # legitimately change on their own (see wp_reg_is_stable_class).
+    wp_v=$(wp_get_maybe_stable "$wp_r") || exit 1
+    printf '%s\n' "$wp_v"
+    ;;
+
+set)
+    wp_require
+    [ $# -eq 3 ] || { wp_usage; exit 1; }
+    wp_r=$(wp_reg_num "$2") || exit 2
+    wp_set "$wp_r" "$3"
+    ;;
+
+names)
+    printf '%3s  %s\n' reg name
+    for wp_r in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 17 18 19 20 21 22 23 24 25 26 \
+                27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 \
+                47 48 49; do
+        printf '%3d  %s\n' "$wp_r" "$(wp_reg_name "$wp_r")"
+    done
+    ;;
+
+regs)
+    wp_require
+    # `regs` prints the registers this DESIGN uses; `regs --all` adds the ones
+    # it does not, which is what a backup or an investigation wants — an
+    # unrecognised factory value hides precisely where nothing looks.
+    #
+    # Alarm1/2 (27-36) belong in the base list, not behind --all: they are
+    # registers active tooling in this design writes (e.g. an alarm-arming
+    # supervisor and a scheduler), not factory leftovers nobody looks at.
+    wp_all=0; [ "${2:-}" = "--all" ] && wp_all=1
+    printf '%3s  %-18s %5s   %s\n' reg name raw meaning
+    for wp_r in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 17 18 19 20 21 22 23 24 25 26 \
+                27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 \
+                47 48 49 \
+                $([ "$wp_all" = 1 ] && echo "50 51 52 53 54 55 56 57 58 59 60 \
+                   61 62 63 64 65 66 67 68 69 70 71"); do
+        # wp_get_maybe_stable dispatches correctly for both halves of this
+        # loop on its own: stable-and-outvoted for the base list (0-49 minus
+        # 1/3/5), plain wp_get for the live telemetry (1/3/5) and the --all
+        # RTC/temp block, which are SUPPOSED to change between two reads.
+        wp_v=$(wp_get_maybe_stable "$wp_r") || wp_v=
+        if [ -z "$wp_v" ]; then
+            printf '%3d  %-18s %5s   %s\n' "$wp_r" "$(wp_reg_name "$wp_r")" '?' 'unreadable'
+            continue
+        fi
+        printf '%3d  %-18s %5s   %s\n' "$wp_r" "$(wp_reg_name "$wp_r")" \
+            "$wp_v" "$(wp_reg_decode "$wp_r" "$wp_v")"
+    done
+    ;;
+
+check)
+    # Read-only. The delta, not a summary — because on this board "applied" and
+    # "still at the factory default" look identical from the outside.
+    wp_require
+    # Board-registry calibration first: fills only what the environment leaves
+    # unset, so /data/wittypi.env (injected by the unit) always wins. The
+    # delta below is then computed against the same effective intent
+    # `configure` applies. See wp_load_board_env's header for the contract.
+    if wp_load_board_env; then
+        printf '  board %s — calibration defaults from %s\n' "$(wp_board_id)" "$WP_BOARD_ENV_APPLIED"
+    fi
+    wp_pol=$(wp_policy) || exit $?
+    # ── Sanity before comparison ────────────────────────────────────────────
+    # A contradictory policy is not something to report a delta against: the
+    # delta would say which registers differ from a table that is itself wrong.
+    # Refuse, with the contradiction named. See the note at `configure`.
+    wp_sanity "$wp_pol" || exit $?
+    wp_rc=0
+    wp_n=0
+    while IFS="$WP_TAB" read -r wp_r wp_v wp_l; do
+        [ -n "$wp_r" ] || continue
+        wp_n=$(( wp_n + 1 ))
+        # Every register wp_policy() emits is, by construction, one this
+        # design writes and nothing else changes — the exact precondition
+        # wp_get_stable needs. Outvotes a one-off glitch rather than
+        # reporting a real board as out of sync (or an out-of-sync one as
+        # fine) on the strength of a single bad read.
+        wp_got=$(wp_get_maybe_stable "$wp_r") || wp_got='?'
+        if [ "$wp_got" = "$wp_v" ]; then
+            printf '  ok   %3s  %-38s %s\n' "$wp_r" "$wp_l" "$wp_v"
+        else
+            printf '  ✗    %3s  %-38s want %s, board holds %s\n' \
+                "$wp_r" "$wp_l" "$wp_v" "$wp_got"
+            wp_rc=2
+        fi
+    done <<EOF
+$wp_pol
+EOF
+    if [ "$wp_rc" -eq 0 ]; then
+        printf 'in sync — all %s policy registers match.\n' "$wp_n"
+    else
+        # The unit, not the bare command. /data/wittypi.env is loaded by
+        # systemd's EnvironmentFile= on wittypi-configure.service; an
+        # interactive shell does not source it. So `wittypi configure` typed
+        # at a prompt applies the COMPILED defaults and silently discards
+        # every site value — which on a board correctly holding a custom
+        # value would overwrite it with the compiled one, in direct response
+        # to this very hint.
+        printf 'OUT OF SYNC — run: systemctl restart wittypi-configure.service\n' >&2
+        printf '  (NOT bare "wittypi configure" — that skips /data/wittypi.env\n' >&2
+        printf '   and would apply compiled defaults over your site settings.)\n' >&2
+    fi
+    exit "$wp_rc"
+    ;;
+
+configure)
+    # ── Every write is read back and COMPARED ──────────────────────────────
+    # Same lesson as rtc-write: a check whose result is discarded is not a
+    # check. i2cset can fail silently, and a register that did not take is
+    # indistinguishable from one that did until the moment it was needed —
+    # which for these rows can be a brownout on an unattended, unreachable
+    # board.
+    wp_require
+    # Board-registry calibration first — same call, same precedence as
+    # `check`, so what check compares is what configure applies. The
+    # environment (the unit's /data/wittypi.env) always wins; the registry
+    # only fills what it leaves unset.
+    if wp_load_board_env; then
+        printf '  board %s — calibration defaults from %s\n' "$(wp_board_id)" "$WP_BOARD_ENV_APPLIED"
+    fi
+    wp_pol=$(wp_policy) || exit $?
+
+    # ── Sanity before the first write ───────────────────────────────────────
+    # This check needs to actually be called, not merely exist. A sanity
+    # function that is written, tested and documented but invoked by nothing
+    # protects nobody — the contradictions it refuses can still all be
+    # applied to a board, and a guard that exists but never runs looks
+    # exactly like a guard that runs and finds nothing.
+    #
+    # It REFUSES rather than warns, and exits before writing anything, for the
+    # same reason every other refusal here does: a half-applied policy on a
+    # power controller is worse than an unapplied one, and a warning nobody
+    # reads the journal for is not a control.
+    wp_sanity "$wp_pol" || exit $?
+
+    wp_rc=0
+    while IFS="$WP_TAB" read -r wp_r wp_v wp_l; do
+        [ -n "$wp_r" ] || continue
+        # wp_get_maybe_stable, same reasoning as `check`: every register
+        # wp_policy() emits only changes when this design writes it, so a
+        # one-off glitch is outvoted rather than triggering (or masking) a
+        # write it did not need.
+        wp_got=$(wp_get_maybe_stable "$wp_r") || wp_got='?'
+        if [ "$wp_got" = "$wp_v" ]; then
+            printf '  ok   %3s  %-38s %s\n' "$wp_r" "$wp_l" "$wp_v"
+            continue
+        fi
+        wp_set "$wp_r" "$wp_v"
+        wp_new=$(wp_get_maybe_stable "$wp_r") || wp_new='?'
+        if [ "$wp_new" = "$wp_v" ]; then
+            printf '  set  %3s  %-38s %s -> %s\n' "$wp_r" "$wp_l" "$wp_got" "$wp_v"
+        else
+            printf '  FAIL %3s  %-38s wrote %s, reads back %s\n' \
+                "$wp_r" "$wp_l" "$wp_v" "$wp_new" >&2
+            wp_rc=2
+        fi
+    done <<EOF
+$wp_pol
+EOF
+
+    # ── Stale "triggered and unprocessed" flags ────────────────────────────
+    # Registers 39/40 can be found reading 1 on a board that has never had
+    # an alarm set, which would make the first "why did I wake" answer a
+    # lie. Cleared ONLY when no schedule exists, so that once something is
+    # writing alarms this cannot reach in and destroy state it does not own.
+    wp_sched=0
+    for wp_r in 27 28 29 30 32 33 34 35; do
+        [ "$(wp_get_maybe_stable "$wp_r")" = "0" ] || wp_sched=1
+    done
+    if [ "$wp_sched" -eq 0 ]; then
+        for wp_r in "$WP_REG_FLAG_ALARM1" "$WP_REG_FLAG_ALARM2"; do
+            if [ "$(wp_get_maybe_stable "$wp_r")" != "0" ]; then
+                wp_set "$wp_r" 0
+                printf '  set  %3s  %-38s stale, no schedule is set\n' "$wp_r" 'alarm flag'
+            fi
+        done
+    fi
+
+    [ "$wp_rc" -eq 0 ] || printf 'SOME REGISTERS DID NOT TAKE — the policy is NOT applied.\n' >&2
+    exit "$wp_rc"
+    ;;
+
+*)
+    wp_usage
+    exit 1
+    ;;
+esac

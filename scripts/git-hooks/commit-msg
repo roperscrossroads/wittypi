@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Reject commit messages that carry a private-infrastructure shape (RFC1918
+# address, reserved/internal DNS suffix). GENERIC patterns only — this hook
+# holds no specific domain or hostname. Bypass with `git commit --no-verify`
+# only for a verified false positive.
+#
+# Install: ln -sf ../../scripts/git-hooks/commit-msg .git/hooks/commit-msg
+set -euo pipefail
+
+msg=$(grep -v '^#' "$1" || true)
+
+patterns=(
+  '\b10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b'
+  '\b172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}\b'
+  '\b192\.168\.[0-9]{1,3}\.[0-9]{1,3}\b'
+  '\b[a-z0-9-]+\.home\.arpa\b'
+  '\b[a-z0-9-]+\.(internal|intranet|lan|localdomain)\b'
+)
+
+for pat in "${patterns[@]}"; do
+  if match=$(printf '%s' "$msg" | grep -Eio "$pat" | head -1); [ -n "$match" ]; then
+    cat >&2 <<EOF
+✗ commit message contains a private-infrastructure shape.
+
+  matched: ${match}
+
+  Rule: don't put private IPs / internal DNS names in the commit history of a
+  public repo. Bypass with --no-verify only if it's a verified false positive.
+EOF
+    exit 1
+  fi
+done
+exit 0

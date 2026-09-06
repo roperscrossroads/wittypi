@@ -1,0 +1,234 @@
+#!/bin/sh
+# Witty Pi 4 power-sequencing daemon.
+#
+# WHAT IT DOES, IN ORDER
+# ----------------------
+#   1. refuses to run if 1-Wire has taken GPIO-4 (the halt line)
+#   2. tells the MCU the system is up, via a pulse train on GPIO-17
+#   3. blocks on GPIO-4 going low — the MCU's shutdown REQUEST
+#   4. runs the bounded pre-shutdown gate (WITTYPI.md, "Design pattern" layer 2)
+#   5. powers off, at which point TXD drops and the MCU cuts the rail
+#
+# The controller also has its own timeout-based forced cut independent of
+# this daemon (WITTYPI.md, "The three facts that shape everything") — the
+# rail drops POWER_CUT_DELAY after the request whether or not this script
+# gets anywhere. So a dead or hung daemon doesn't hold the rail up forever.
+#
+# What this script buys on top of that, and it isn't small: a *graceful*
+# shutdown within that budget. Every exit path below ends in `poweroff` so
+# persistent storage is unmounted before the rail goes.
+#
+# WHY NOT THE VENDOR'S daemon.sh
+# ------------------------------
+# It needs wiringPi, which is deprecated upstream. Every `gpio` call it makes
+# maps onto libgpiod, which is the interface the kernel actually wants used
+# today. The vendor script also runs three user hook scripts, logs to files
+# beside itself on what may be a read-only rootfs, and re-implements `date`
+# arithmetic that busybox doesn't share.
+
+set -u
+
+WP_LIB="${WITTYPI_LIB:-/usr/libexec/site/wittypi-lib.sh}"
+# shellcheck source=/dev/null
+. "$WP_LIB"
+
+WP_GATE="${WITTYPI_GATE:-/usr/libexec/site/wittypi-before-shutdown}"
+# Overridable so the offline suite can point it at a stub, and so a site that
+# doesn't want outbound notifications can empty it without patching the
+# daemon. Both are optional hooks — if not present/executable, the daemon
+# just skips them and proceeds straight to poweroff.
+WP_NOTIFY_STATE="${WITTYPI_NOTIFY_STATE:-/usr/libexec/site/notify-state}"
+WP_WAKE_GUARD="${WITTYPI_WAKE_GUARD:-/usr/libexec/site/wake-guard}"
+
+# ── The one conflict that makes this hardware unusable ─────────────────────
+# dtoverlay=w1-gpio defaults to GPIO-4, which is the halt line. The manual
+# names it as a cause of "Witty Pi 4 does not boot". If something has claimed
+# the line, say so loudly rather than sitting in a gpiomon that can never
+# fire: a silent no-op here means the board never shuts down on schedule and
+# drains the battery, which is the expensive failure.
+wp_check_line_free() {
+    wp_clf_consumer=$(gpioinfo -c "$1" 2>/dev/null \
+        | awk -v p="$WP_HALT_PIN" '$1 == p { print }' \
+        | grep -oE 'consumer="[^"]*"' | cut -d'"' -f2)
+    case "$wp_clf_consumer" in
+        ''|unused|"$WP_HALT_PIN") return 0 ;;
+        *)
+            wp_log "GPIO-$WP_HALT_PIN is held by \"$wp_clf_consumer\"."
+            wp_log "The Witty Pi needs it to request shutdown. 1-Wire on GPIO-4 is the"
+            wp_log "usual cause (manual 15.5). Refusing to start."
+            return 1 ;;
+    esac
+}
+
+wp_chip=$(wp_gpiochip) || {
+    wp_log "no pinctrl-bcm GPIO chip found — is this a Pi? Not sequencing power."
+    exit 0
+}
+
+wp_check_line_free "$wp_chip" || exit 1
+
+# ── "No bus" and "no board" are different diagnoses ────────────────────────
+# Both make wp_present fail, and conflating them sends someone looking for a
+# hardware fault when the real cause is a missing dtparam. A missing
+# /dev/i2c-N usually means the image was built without I2C enabled — a build
+# problem, not a wiring one. The path is overridable for the same reason
+# other paths in this daemon are: without it the offline test suite can't
+# drive this script at all on a build host.
+WP_I2C_DEV="${WITTYPI_I2C_DEV:-/dev/i2c-$WP_BUS}"
+if [ ! -e "$WP_I2C_DEV" ]; then
+    wp_log "/dev/i2c-$WP_BUS does not exist — the I2C bus is not enabled."
+    wp_log "This image was built without I2C enabled; the controller cannot be"
+    wp_log "reached even though it may be physically fitted."
+    exit 1
+fi
+
+# ── Absent controller is not an error ──────────────────────────────────────
+# A Pi on the bench with no Witty Pi fitted is a normal configuration. Exit 0
+# so the unit doesn't enter failed state and drag other boot targets down
+# with it.
+if ! wp_present; then
+    wp_log "no controller at $WP_ADDR on i2c-$WP_BUS — not fitted. Nothing to sequence."
+    exit 0
+fi
+
+wp_rev=$(wp_get "$WP_REG_FW_REVISION") || wp_rev="?"
+wp_reason=$(wp_get "$WP_REG_ACTION_REASON") || wp_reason="?"
+wp_log "controller present, firmware revision $wp_rev, last action reason $wp_reason"
+
+# Telemetry many similar controllers can't offer at all. Logged once per boot
+# so the journal carries a power record even when nothing is watching.
+wp_vin=$(wp_read_pair "$WP_REG_VIN_INT" "$WP_REG_VIN_DEC") || wp_vin="?"
+wp_vout=$(wp_read_pair "$WP_REG_VOUT_INT" "$WP_REG_VOUT_DEC") || wp_vout="?"
+wp_iout=$(wp_read_pair "$WP_REG_IOUT_INT" "$WP_REG_IOUT_DEC") || wp_iout="?"
+wp_log "Vin=${wp_vin}V Vout=${wp_vout}V Iout=${wp_iout}A"
+
+# Guaranteed wake (WITTYPI.md, "Design pattern" layer 3) is the last-resort
+# defence against a corrupt schedule. Say so at boot if this board can't do
+# it, because the alternative is discovering it the first time a corrupt
+# schedule leaves the board asleep permanently.
+if ! wp_has_guaranteed_wake; then
+    wp_log "WARNING: firmware revision $wp_rev predates guaranteed wake (needs \
+$WP_MIN_REV_GUARANTEED_WAKE). WITTYPI.md layer 3 is NOT available on this board."
+fi
+
+# ── Let the halt line settle before trusting it — but bound the wait ───────
+# The settle itself is straight from the vendor daemon and worth keeping: the
+# halt line needs to read high consistently before we arm on its falling
+# edge, or the power-on transient is mistaken for a shutdown request and the
+# board turns itself off immediately after booting.
+#
+# The wait is bounded rather than open-ended: an unbounded wait on this
+# hardware isn't a delay, it's a held rail and a flat battery if the halt
+# line is ever stuck low. The deadline is computed once from the monotonic
+# clock, nothing in the loop can extend it, and expiry proceeds rather than
+# blocks — because sending SYS_UP matters *more* when the halt line looks
+# wrong, not less. It's what lets the MCU cut the rail at all; refusing to
+# send it because GPIO-4 is misbehaving would remove the last mechanism that
+# can power this board down.
+WP_SETTLE="${WITTYPI_HALT_SETTLE_SEC:-15}"
+wp_now() { cut -d' ' -f1 "${PROC_UPTIME:-/proc/uptime}" | cut -d. -f1; }
+wp_deadline=$(( $(wp_now) + WP_SETTLE ))
+wp_stable=0
+while [ "$wp_stable" -lt 5 ]; do
+    if [ "$(wp_now)" -ge "$wp_deadline" ]; then
+        wp_log "WARNING: GPIO-$WP_HALT_PIN did not read high for 5 consecutive \
+seconds within ${WP_SETTLE}s (last read: '$(wp_halt_level "$wp_chip")')."
+        wp_log "Arming anyway — an unsent SYS_UP means the MCU never watches TXD \
+and the rail is never cut, which is worse than a spurious shutdown request."
+        break
+    fi
+    if [ "$(wp_halt_level "$wp_chip")" = "1" ]; then
+        wp_stable=$(( wp_stable + 1 ))
+    else
+        wp_stable=0
+    fi
+    sleep 1
+done
+
+# ── SYS_UP: one invocation, not four ────────────────────────────────────────
+# The waveform is 1-0-1-0 at 100 ms, which is what the vendor produces with
+# four wiringPi writes. It must be a single gpioset: libgpiod releases a line
+# when the process holding it exits ("any GPIO lines it has requested are
+# automatically released"), so four sequential calls would drop the line
+# between every pulse and emit a different waveform than the one intended.
+#
+# --toggle semantics, read from the libgpiod source rather than assumed:
+# toggle_sequence() sleeps period[i] THEN toggles, and returns when it
+# reaches a final period of 0. So `-t 100ms,100ms,100ms,0` is exactly
+# 1(100ms) 0(100ms) 1(100ms) 0 — and -p holds that last level before the
+# process exits.
+#
+# Why a train and not one edge: PIN_SYS_UP and PIN_LED are the same ATtiny
+# pin, and the firmware only accepts the signal when the LED is off. The
+# repeats are retries for a window this side can't observe directly.
+wp_log "signalling SYS_UP on GPIO-$WP_SYSUP_PIN"
+if ! gpioset -c "$wp_chip" -p 100ms -t 100ms,100ms,100ms,0 \
+        "$WP_SYSUP_PIN"=1 2>/dev/null; then
+    wp_log "WARNING: SYS_UP signal failed. The MCU may not know the system came up."
+fi
+
+# ── Block until the MCU asks for shutdown ──────────────────────────────────
+# Pull-up for the same reason wp_halt_level uses one: the MCU pulls the line
+# down, so an unbiased line can float low and fake a request.
+wp_log "armed — waiting for GPIO-$WP_HALT_PIN to fall"
+gpiomon -b pull-up -e falling -n 1 -c "$wp_chip" "$WP_HALT_PIN" >/dev/null 2>&1 || {
+    wp_log "gpiomon failed on GPIO-$WP_HALT_PIN; cannot detect the shutdown request."
+    exit 1
+}
+
+wp_reason=$(wp_get "$WP_REG_ACTION_REASON") || wp_reason="?"
+case "$wp_reason" in
+    "$WP_REASON_ALARM2")            wp_why="scheduled shutdown (alarm2)" ;;
+    "$WP_REASON_CLICK")             wp_why="button clicked or GPIO-$WP_HALT_PIN pulled low" ;;
+    "$WP_REASON_LOW_VOLTAGE")       wp_why="input voltage too low" ;;
+    "$WP_REASON_OVER_TEMPERATURE")  wp_why="over temperature" ;;
+    "$WP_REASON_BELOW_TEMPERATURE") wp_why="below temperature" ;;
+    *)                              wp_why="reason code $wp_reason" ;;
+esac
+wp_log "shutdown requested: $wp_why"
+
+# ── Say we are going, and when we intend to be back — here, not later ──────
+# Three reasons this notification happens now rather than after the gate:
+#
+#   1. The network is still up. Any later point races systemd tearing down
+#      the network interface, and the message that matters most — "nothing
+#      is set to wake me" — is the one that would be lost.
+#   2. The alarm registers still hold the schedule, read over I2C; nothing
+#      clears them here, but the further into shutdown this runs the more
+#      can go wrong reading them.
+#   3. It's before the pre-shutdown gate, so the two delays don't stack — the
+#      gate can spend its own full budget and this has already finished.
+#
+# It's also on the clock the rail is counting: POWER_CUT_DELAY started when
+# the halt line fell, a few lines above, and every step from here to
+# `poweroff` shares that same budget with the gate and with Linux's own
+# shutdown sequence.
+#
+# ── Never go dark with no way back ─────────────────────────────────────────
+# This runs before the notification, and the order is the point: if an
+# optional wake-guard hook arms a fallback wake, the message that follows
+# must report the alarm that will *actually* fire — not the empty registers
+# the guard just fixed. Reversed, the board would announce "wake set for
+# NONE" and then quietly wake anyway, which is the more confusing failure,
+# because it teaches you to distrust a message that is in fact working.
+if [ -x "$WP_WAKE_GUARD" ]; then
+    "$WP_WAKE_GUARD" ensure || true
+fi
+
+# Failure is ignored on purpose: a well-behaved notifier exits 0 by
+# construction, and a board that can't notify must still power down cleanly.
+if [ -x "$WP_NOTIFY_STATE" ]; then
+    WITTYPI_REASON="$wp_reason" "$WP_NOTIFY_STATE" shutdown || true
+fi
+
+# The bounded gate. It's allowed to fail; it is not allowed to hang, and if
+# it somehow does, the rail stays up — so its own deadline is the only
+# protection, and this call deliberately adds no second one that could mask
+# that.
+if [ -x "$WP_GATE" ]; then
+    WITTYPI_REASON="$wp_reason" "$WP_GATE" || \
+        wp_log "gate exited non-zero; powering off regardless"
+fi
+
+wp_log "powering off"
+exec systemctl poweroff

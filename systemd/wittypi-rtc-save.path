@@ -1,0 +1,32 @@
+[Unit]
+Description=Write the RTC once the clock is genuinely synchronised
+
+# ── Why a .path unit, and not just the service's own condition ─────────────
+# A plain ConditionPathExists on the service alone doesn't work: systemd
+# evaluates a Condition ONCE, when the job runs. This unit is pulled in at
+# boot, while NTP typically synchronises a minute or so later — especially
+# over a cellular or WiFi link that has to associate and get a lease first.
+# So a condition checked at boot time is guaranteed false every time, and the
+# RTC would never get written.
+#
+# The mirror-image mistake is gating on a target that's merely "reached",
+# rather than a file that reflects current state — that gates on something
+# passive and always true, and ends up writing the boot-time floored clock
+# into the RTC on every boot instead of a genuinely synchronised time.
+#
+# A .path unit watches for the file rather than sampling it once, so the
+# write happens *when* the sync actually lands, whenever that is. The
+# service keeps its own ConditionPathExists too, as a belt-and-braces check
+# for the direct `systemctl start` case.
+#
+# ── It re-arms on every boot, which is the point on a duty-cycled board ────
+# The time-sync daemon removes its "synchronized" marker file on shutdown, so
+# a board that wakes repeatedly through the day gets a fresh RTC write on
+# each wake once its network link is up — which also serves as drift
+# correction, with no separate timer needed.
+[Path]
+PathExists=/run/systemd/timesync/synchronized
+Unit=wittypi-rtc-save.service
+
+[Install]
+WantedBy=multi-user.target

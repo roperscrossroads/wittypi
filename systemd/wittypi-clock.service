@@ -1,0 +1,83 @@
+[Unit]
+Description=Set the system clock from the Witty Pi 4 RTC
+
+# ── Why this unit matters more than it looks ────────────────────────────────
+# This looks like a convenience — nicer timestamps in the journal — but it can
+# be load-bearing anywhere downstream logic trusts a certificate's validity
+# window or a timestamp comparison:
+#
+#   * There is no /dev/rtc on this controller (WITTYPI.md: the PCF85063 is on
+#     the MCU's internal bus, proxied as registers 50-71), so nothing sets the
+#     clock at boot and systemd floors it at whatever epoch the image was
+#     built with.
+#   * A certificate check (`openssl verify`, TLS, a signed-update
+#     verification step) run against that floored clock can fail with
+#     "certificate is not yet valid" if the cert's notBefore postdates the
+#     image build — even though the certificate and the update it's
+#     verifying are both genuinely fine.
+#   * If that verification failure feeds into an A/B update mechanism's
+#     health check, a board with no time source doesn't just refuse one
+#     update — it can walk itself into failing the health check on every
+#     slot it boots into, since every slot shares the same floored clock and
+#     the same certificate. That's a fault in neither slot, showing up as if
+#     both were bad.
+#
+# Any health-check logic downstream should distinguish "the clock looks
+# implausible" from "the trust root is genuinely broken" so this failure mode
+# can't happen even if this unit itself fails to run. This unit is what makes
+# the good case good.
+
+# ── Ordering: do not add `Before=systemd-timesyncd.service`, ever ──────────
+# It looks tempting — set the RTC-based clock, then let NTP correct it later.
+# It creates an ordering cycle instead: `systemd-timesyncd.service` has
+# `DefaultDependencies=no` and is `WantedBy=sysinit.target`, so it must finish
+# *before* sysinit — while this unit runs after `basic.target`, which is
+# after sysinit. The ordering can never be satisfied, and systemd resolves
+# the cycle by deleting a job — sometimes timesyncd's own start job, silently
+# removing NTP from the boot with no failed-unit indication anywhere.
+#
+# The ordering isn't needed anyway: if timesyncd starts first and syncs
+# later, it simply corrects whatever this unit set, which is the normal,
+# intended relationship between an RTC and a network time source.
+
+# ── One I2C bus, multiple units, and they must not overlap ─────────────────
+# Reading the RTC over this controller takes several separate I2C
+# transactions, because the MCU proxies the PCF85063 and refuses bulk reads.
+# If this unit and a register-policy unit (e.g. wittypi-configure.service)
+# run concurrently on the same bus, an interleaved transaction can straddle a
+# clock tick and tear the multi-byte read — and if that happens with no time
+# set yet, a naive RTC-save routine can end up writing systemd's floored
+# clock *back into* the RTC, destroying a good time the coin cell had just
+# carried across a reboot.
+#
+# So serialise anything that touches this bus: clock sync, then register
+# policy, then the daemon (wittypi-configure.service already declares
+# `Before=wittypi.service`). Clock goes first because the earlier the board
+# knows the time, the more of the journal is usefully timestamped.
+After=basic.target
+Before=wittypi-configure.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The flock is what keeps every other current and future I2C accessor out of
+# this window, rather than requiring each new one to be added to an
+# ever-growing explicit ordering chain.
+ExecStart=/usr/bin/flock -w 10 /run/wittypi.lock /usr/bin/wittypi rtc-sync
+
+# `wittypi rtc-sync` exits 1 for two legitimate cases: no controller fitted,
+# and an RTC that has lost power and reads its 2000-01-01 epoch (it refuses
+# to sync from that — syncing would move the board to year 2000, which is
+# worse than leaving the floored clock alone). Neither is a reason to fail
+# the boot, so both are accepted here.
+#
+# Nothing downstream should trust this unit's own exit status as proof the
+# board knows the time — a health check that cares should read the clock
+# itself and judge its plausibility directly, since "the unit succeeded" and
+# "the board knows the time" are different claims.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

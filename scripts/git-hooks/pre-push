@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# pre-push: run the trust-tier guard over the commits being pushed BEFORE they
+# leave the machine (primary enforcement; the GitHub Actions workflow is the
+# backstop for when this hook is skipped/uninstalled).
+#
+# Install: bash scripts/git-hooks/install.sh  (or)
+#          ln -sfn ../../scripts/git-hooks/pre-push .git/hooks/pre-push
+#
+# Bypass with `git push --no-verify` only as a last resort.
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+scan="$root/scripts/trust-tier/scan.sh"
+[ -x "$scan" ] || chmod +x "$scan" 2>/dev/null || true
+
+z='0000000000000000000000000000000000000000'
+rc=0
+
+# git feeds "<local ref> <local oid> <remote ref> <remote oid>" per ref on stdin.
+while read -r _local_ref local_oid _remote_ref remote_oid; do
+  [ "$local_oid" = "$z" ] && continue                 # branch deletion — nothing to scan
+  if [ "$remote_oid" = "$z" ]; then
+    base="$(git merge-base "$local_oid" origin/main 2>/dev/null || true)"
+    range="${base:+$base..}$local_oid"
+  else
+    range="$remote_oid..$local_oid"
+  fi
+  bash "$scan" "$range" || rc=1
+done
+
+if [ "$rc" -ne 0 ]; then
+  cat >&2 <<'EOF'
+
+✗ pre-push: trust-tier guard found an issue in the commits you're pushing.
+  This repo mirrors to a PUBLIC GitHub org — fix the finding above before pushing.
+  Bypass with `git push --no-verify` ONLY if it's a verified false positive.
+EOF
+fi
+exit "$rc"

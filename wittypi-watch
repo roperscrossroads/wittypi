@@ -1,0 +1,515 @@
+#!/bin/sh
+# wittypi-watch — periodic READ-ONLY supervisor for the Witty Pi controller.
+#
+# Runs from wittypi-watch.timer every 15 minutes and answers one question:
+# has anything load-bearing silently drifted while the node was up?
+#
+# It writes no register, and that rule does not bend. A supervisor that heals
+# by writing is a second writer with all of a writer's failure modes, and the
+# reason the I2C-locking design stays simple is that this stays a pure reader
+# — it takes no lock (see below) precisely because it cannot corrupt anything
+# by being interrupted.
+#
+# But it does not only talk, either. Detect-and-page alone means a page about
+# a days-old broken appointment and nothing else, for a state that one
+# systemctl call would have cleared — and an unattended node cannot phone a
+# human. So where a check finds a condition whose repair is ALREADY OWNED BY
+# ANOTHER UNIT, this asks that unit to run:
+#
+#   RTC disagrees with a synced clock  -> wittypi-rtc-save.service
+#   alarm2 missing or past-dated       -> wittypi-schedule.service
+#
+# That is a request, not a write. The owning unit keeps the lock, the TERM
+# trap, the read-back and the refusals; this script keeps its single
+# responsibility and its 1s TimeoutStopSec. Repair is bounded (three
+# attempts per boot), gated on a trustworthy clock, and switchable off with
+# WITTYPI_WATCH_REPAIR=0. The verdict is always read back from the registers
+# on a LATER tick — never assumed from the fact that a request was made.
+#
+# The prerequisite is that the scheduler is idempotent. Re-running it is only
+# safe because it anchors appointments on absolute cycle phase; a scheduler
+# computing `now + ON_SEC` instead would have every repair silently move the
+# duty cycle. Do not wire a repair to a writer that is not a pure function of
+# the clock.
+#
+# Four checks, and why exactly these four:
+#
+#   1. Guaranteed wake (register 49) — the last-resort backstop. Every other
+#      wake path can fail and the node still returns within this window; if
+#      THIS register quietly reads 0 the node can go dark until a human
+#      visits it. wittypi-configure re-asserts it at boot, but an
+#      EEPROM losing a write, or an MCU restart resurrecting a compiled
+#      default, happens WHILE the node is up — which is the window nothing
+#      else watches.
+#   2. Alarm1 armed-state — via `wake-guard check`, its exact tri-state, no
+#      reimplementation of armed()'s day-validation. Informational, not a
+#      hazard: not-armed is the legitimate idle state (wake-guard arms at
+#      shutdown), and "cannot read" is indistinguishable from benign lock
+#      contention — see the case below for why that is SKIPPED, not paged.
+#   3. RTC plausibility — a bound against something the RTC did not itself
+#      produce, which is what catches a multi-hour drift.
+#      wp_rtc_read_confirmed() catches a transient misread; only a
+#      comparison against the NTP-synced system clock can catch a clock
+#      that is stable AND wrong. Gated on systemd-timesync's synchronized
+#      flag so an unsynced, floored clock before WiFi associates does not
+#      read as an RTC fault.
+#   4. The schedule's shutdown appointment — only where /data/
+#      wittypi-schedule.env opts the node in (hand-scheduled and bench
+#      nodes never page from this). A configured node whose alarm2 is
+#      missing or PAST-dated is a node that will NOT stop itself: the
+#      firmware's 2-second window means a missed alarm does not fire late,
+#      it does not fire at all, and nothing else detects the miss (an
+#      alarm2 consumed while the rail was down, or a clock step across the
+#      appointment). Alarm1 in the past is
+#      log-only: the MCU defers a wake that fires while the node is up and
+#      re-fires it ~4 s after the next power-off, so that state self-heals.
+#
+# No trap handlers, deliberately — and a test asserts it stays that way.
+# wittypi-watch.service is stopped BEFORE wake-guard.service's ExecStop runs
+# (see the unit's ordering comment), and its TimeoutStopSec is 1 s precisely
+# because a trap-free, read-only shell script dies on the first SIGTERM in
+# milliseconds with nothing to clean up. A trap here would be budget spent on
+# the shutdown path for a script with no state to protect.
+#
+# No I2C lock, deliberately. A flock -w wrap here would HOLD the lock for the
+# whole run, and a shutdown racing a tick would find wake-guard's `ensure` —
+# 1 s wait, gives up rather than blocks — timing out against a supervisor,
+# arming NOTHING. The reader must never be able to starve the one writer that
+# matters. Ordering (the unit's stop-before relationship), not locking, is
+# what serialises the shutdown coincidence; mid-tick reads torn by some OTHER
+# accessor cost at worst a wrong log line this tick.
+#
+# Overridable paths mirror wake-guard's own test seams (WAKE_GUARD_ENV,
+# WAKE_GUARD_WITTYPI, WAKE_GUARD_LOCK): the offline suite points these into
+# a fixture; the shipped unit runs the defaults.
+
+WP_WATCH_LIB="${WITTYPI_WATCH_LIB:-/usr/libexec/site/wittypi-lib.sh}"
+WP_WATCH_WAKE_GUARD="${WITTYPI_WATCH_WAKE_GUARD:-/usr/libexec/site/wake-guard}"
+WP_WATCH_NOTIFY="${WITTYPI_WATCH_NOTIFY:-/usr/bin/notify}"
+WP_WATCH_RECORD="${WITTYPI_WATCH_RECORD:-/data/wittypi-watch-hazards}"
+WP_WATCH_SYNCED="${WITTYPI_WATCH_SYNCED:-/run/systemd/timesync/synchronized}"
+WP_WATCH_SCHEDULE="${WITTYPI_WATCH_SCHEDULE:-/data/wittypi-schedule.env}"
+
+# ── THE REPAIR SEAM ────────────────────────────────────────────────────────
+# The watch still writes no register. The header's rule stands, and this does
+# not bend it: repair means asking the unit that already owns the write to
+# run. wittypi-schedule holds the I2C lock through its unit's flock wrap,
+# carries the TERM trap that makes a half-written alarm impossible, and
+# enforces both schedule bounds; wittypi-rtc-save verifies every field it
+# writes. Reimplementing either here would be a second writer with all of a
+# writer's failure modes — which is exactly what the header forbids. Handing
+# the job to the existing writer costs one systemctl call and keeps this
+# script a pure reader that has never taken the lock.
+# Absolute, and /usr/bin — the same path wittypi-shutdown-gate uses. Not the
+# bare name: where the gate is installed, /usr/sbin/{poweroff,halt,shutdown}
+# are symlinks to it, and a PATH lookup from a script is exactly the ambiguity
+# the gate was written to remove.
+WP_WATCH_SYSTEMCTL="${WITTYPI_WATCH_SYSTEMCTL:-/usr/bin/systemctl}"
+WP_WATCH_UPTIME="${PROC_UPTIME:-/proc/uptime}"
+
+# The kill switch. A node whose repairs are making things worse must be
+# returnable to log-and-page with one line in /data/wittypi.env, not a
+# reflash.
+WP_WATCH_REPAIR="${WITTYPI_WATCH_REPAIR:-1}"
+
+# Bounded, and the counter lives in /run so it resets every boot. A
+# condition the scheduler cannot fix is not made fixable by asking again
+# every 15 minutes forever — that is a unit restart loop in the journal and
+# a page every tick, i.e. the alarm fatigue this whole file exists to avoid.
+# Three attempts, then stop trying and say so. /run is tmpfs: a fresh boot
+# has already re-run the scheduler through its own unit, so the count that
+# matters is always "since this boot".
+WP_WATCH_REPAIR_STATE="${WITTYPI_WATCH_REPAIR_STATE:-/run/wittypi-watch-repairs}"
+WP_WATCH_REPAIR_MAX="${WITTYPI_WATCH_REPAIR_MAX:-3}"
+
+# Set by check 3 when it corrects the RTC, consumed by check 4 on a LATER
+# tick — the deferred re-arm. /run for the same reason as the counter: a
+# boot re-arms through the scheduler's own unit anyway, so a marker that
+# survived a reboot could only ask for work already done.
+WP_WATCH_REARM_MARK="${WITTYPI_WATCH_REARM_MARK:-/run/wittypi-watch-rearm}"
+
+# 300 s: between rtc-save events an honest disagreement is bounded by the
+# PCF85063's ±2 ppm (~0.2 s/day) plus read latency (~1 s) — call it seconds.
+# A real drift fault is hours (the one this was sized against was 43200 s).
+# The bound sits two orders of magnitude above the noise and two below the
+# fault, so neither side can cross it by accident.
+WP_WATCH_RTC_SLOP="${WITTYPI_WATCH_RTC_SLOP:-300}"
+
+# shellcheck source=/dev/null
+. "$WP_WATCH_LIB" || exit 1
+
+# The "no controller" gate sits BELOW the hazard helpers rather than here,
+# because on a node with a schedule configured an unanswering controller is a
+# hazard rather than a bench configuration, and reporting that needs
+# wp_watch_hazard to exist. Nothing
+# between here and there touches I2C — wp_load_board_env reads /proc/cpuinfo
+# and sysfs — so the move costs no bus traffic and changes no ordering.
+
+WP_WATCH_HAZARDS=0
+
+# The durable trail is written FIRST: notify is fire-and-forget by design, so
+# /data is the record and the push is the courtesy copy — the same split
+# wittypi-before-shutdown already uses for a missed mark-good.
+wp_watch_hazard() {
+    # err, not info — a hazard must outlive the reboot. /data carries the
+    # record below, but the journal line is what a human reads first, and on a
+    # node with a volatile journal that keeps only `err` onto persistent
+    # storage, an info-priority verdict is erased by the next power cycle.
+    # Hazards are by definition the states worth reconstructing after the
+    # fact.
+    wp_log_err "watch HAZARD: $1"
+    WP_WATCH_HAZARDS=$(( WP_WATCH_HAZARDS + 1 ))
+    printf '%s  %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$1" \
+        >> "$WP_WATCH_RECORD" 2>/dev/null \
+        || wp_log "watch: could not record the hazard to $WP_WATCH_RECORD"
+    "$WP_WATCH_NOTIFY" -t "wittypi node hazard" -p high -g warning "$1" \
+        >/dev/null 2>&1 || true
+}
+
+# Set when check 3 finds the RTC disagreeing with a synced system clock and
+# could not get it corrected. It gates every repair below: the scheduler
+# anchors on the RTC, so asking it to re-arm from a clock we have just
+# declared untrustworthy would replace a stale appointment with a confidently
+# wrong one — an armed miss, which is strictly worse than a stale register a
+# human can still see.
+WP_WATCH_RTC_SUSPECT=0
+
+# Set when THIS tick wrote the deferred-re-arm marker, so this tick does not
+# also consume it. See where it is written for why that would defeat it.
+WP_WATCH_REARM_FRESH=0
+
+# wp_watch_repair <unit> <what-it-is-for>
+#   0 = the repair was requested, 1 = it was not (disabled, capped, suspect
+#   clock, or systemctl refused). Never blocks and never pages: the caller
+#   decides what the failure to repair MEANS, because that differs per check.
+wp_watch_repair() {
+    if [ "$WP_WATCH_REPAIR" != "1" ]; then
+        wp_log "watch: repair disabled (WITTYPI_WATCH_REPAIR=$WP_WATCH_REPAIR) — $2 left for a human"
+        return 1
+    fi
+    if [ "$WP_WATCH_RTC_SUSPECT" != "0" ]; then
+        wp_log "watch: NOT repairing $2 — the RTC is under suspicion this tick, and an appointment computed from a clock we do not trust is an armed miss"
+        return 1
+    fi
+
+    wp_watch_rn=$(cat "$WP_WATCH_REPAIR_STATE" 2>/dev/null)
+    case "$wp_watch_rn" in ''|*[!0-9]*) wp_watch_rn=0 ;; esac
+    if [ "$wp_watch_rn" -ge "$WP_WATCH_REPAIR_MAX" ]; then
+        wp_log "watch: $WP_WATCH_REPAIR_MAX repair attempts already made this boot — not asking again"
+        return 1
+    fi
+    printf '%s\n' $(( wp_watch_rn + 1 )) > "$WP_WATCH_REPAIR_STATE" 2>/dev/null || true
+
+    # restart, not start. Both units are Type=oneshot RemainAfterExit=yes, so
+    # they stay `active` after their boot run and `systemctl start` on an
+    # already-active unit is a silent no-op — the repair would report success
+    # and do nothing, which is the worst of the three possible outcomes.
+    #
+    # --no-block, and it is not an optimisation. wittypi-schedule allows
+    # itself TimeoutStartSec=30 for a glitchy-bus RTC read; this unit's whole
+    # budget is TimeoutStartSec=10. Waiting would let a slow-but-working
+    # repair blow the watch's own timeout and get this script SIGTERMed
+    # mid-tick — killing the supervisor to fix the thing it supervises. So
+    # the request is fired and the VERDICT IS READ ON THE NEXT TICK, fifteen
+    # minutes later, from the registers themselves. The attempt counter is
+    # what makes that loop terminate.
+    if "$WP_WATCH_SYSTEMCTL" restart --no-block "$1" >/dev/null 2>&1; then
+        wp_log "watch: REPAIRING $2 — asked $1 to re-run (attempt $(( wp_watch_rn + 1 ))/$WP_WATCH_REPAIR_MAX); the next tick reads the registers to confirm"
+        return 0
+    fi
+    wp_log "watch: could not ask $1 to re-run — $2 not repaired"
+    return 1
+}
+
+# Seconds this node has been up. Used to tell "the appointment elapsed while
+# the node was OFF" from "the node was AWAKE and blew through it" — two
+# states with identical registers and opposite severities. Empty if
+# unreadable, and every caller treats that as "cannot tell".
+wp_watch_uptime() {
+    wp_watch_ut=$(cut -d' ' -f1 "$WP_WATCH_UPTIME" 2>/dev/null | cut -d. -f1)
+    case "$wp_watch_ut" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$wp_watch_ut"
+}
+
+# Board-registry defaults, same call and same precedence as configure/check
+# (the environment — the unit's /data/wittypi.env — always wins), so the
+# comparison below runs against the SAME effective intent the boot applied.
+wp_load_board_env >/dev/null 2>&1 || true
+
+# ── 0. is there a controller, and does its absence MEAN anything here? ─────
+# The daemon's convention still holds where it applies: on a bench Pi with no
+# HAT fitted, an absent controller is the normal configuration and this exits
+# 0, quietly. A bench node paging "hazard" every fifteen minutes is how you
+# teach everyone to ignore the pages that matter.
+#
+# But a configured schedule changes what that silence means.
+# /data/wittypi-schedule.env is the node saying "I am on a duty cycle". If it
+# exists and the controller will not answer, then nothing is arming alarms,
+# nothing is going to shut this node down, and the supervisor is blind — check
+# 1, the controller-death detector, sits below this gate and would never run.
+# A gate that cannot tell the two cases apart leaves a node in exactly that
+# state with nothing anywhere saying so, which is why this is the loudest
+# thing the tick can report.
+if ! wp_present; then
+    if [ -r "$WP_WATCH_SCHEDULE" ]; then
+        wp_watch_hazard "a schedule is configured but the controller does not answer on the bus — nothing can arm an alarm, nothing will shut this node down, and every check below is blind. Check the HAT is seated and that GPIO/I2C is not held by something else."
+        wp_log "watch: $WP_WATCH_HAZARDS hazard(s) this tick — see $WP_WATCH_RECORD"
+        exit 1
+    fi
+    wp_log "watch: no controller on the bus — nothing to supervise"
+    exit 0
+fi
+
+# ── 1. guaranteed wake ─────────────────────────────────────────────────────
+# WITTYPI_GUARANTEED_WAKE arrives via the unit's EnvironmentFile
+# (/data/wittypi.env — the same file wittypi-configure reads, so the watch
+# compares against the SAME intent the boot applied). Unset is fine:
+# wp_check_guaranteed_wake still requires the register readable and enabled.
+wp_watch_gw=$(wp_check_guaranteed_wake "${WITTYPI_GUARANTEED_WAKE:-}")
+case $? in
+    0) wp_log "watch: guaranteed wake ok (register 49 = $wp_watch_gw)" ;;
+    1) wp_watch_hazard "guaranteed wake drifted: register 49 reads $wp_watch_gw, site policy says ${WITTYPI_GUARANTEED_WAKE:-?}" ;;
+    3) wp_watch_hazard "guaranteed wake DISABLED: register 49 reads 0 — the last-resort backstop is off" ;;
+    *) wp_watch_hazard "guaranteed-wake register unreadable — the controller is not answering a plain read" ;;
+esac
+
+# ── 1b. the RTC's encoding mode — one bit that poisons every decoder ───────
+# Control_1 bit 1 flips the PCF85063 into 12-hour encoding; the clock keeps
+# perfect time and everything that reads it (the MCU's alarm match included)
+# decodes garbage. It really does flip in the field — torn-frame debris on the
+# controller's internal bus during physical handling will do it, mid-uptime.
+# configure re-asserts 0 at every boot; this catches a mid-uptime flip within
+# one tick. Any nonzero value (STOP, EXT_TEST) is equally bad.
+wp_watch_c1=$(wp_get "$WP_REG_RTC_CTRL1")
+if [ -z "$wp_watch_c1" ]; then
+    wp_log "watch: RTC Control_1 unreadable this tick — skipped"
+elif [ "$wp_watch_c1" != "0" ]; then
+    wp_watch_hazard "RTC Control_1 reads $wp_watch_c1, expected 0 — 12-hour mode or worse: the clock still runs but every 24h decoder (the MCU's alarm match included) reads garbage. Heal live: wittypi set 54 0, then restart wittypi-rtc-save.service"
+fi
+
+# ── 2. alarm1, through wake-guard's own tri-state ──────────────────────────
+# An absent hook exits 127, which is not one of the three states below.
+# Without this branch it falls to the default arm and reads as "controller
+# unreadable" — pointing the next person at the I2C bus when the real answer is
+# that this system has no wake-guard. Checked first, and reported as itself.
+if [ ! -x "$WP_WATCH_WAKE_GUARD" ]; then
+    wp_log "watch: no wake-guard at $WP_WATCH_WAKE_GUARD — alarm1 not checked"
+    wp_watch_alarm_checked=0
+else
+    wp_watch_alarm_checked=1
+fi
+
+if [ "$wp_watch_alarm_checked" = "1" ]; then
+"$WP_WATCH_WAKE_GUARD" check >/dev/null 2>&1
+case $? in
+    0) wp_log "watch: alarm1 armed" ;;
+    1) wp_log "watch: alarm1 not armed — legitimate while up; wake-guard arms one at shutdown" ;;
+    # Skipped, not paged, not retried. State 2 folds together "controller
+    # dead" and "another accessor holds the I2C lock right now" — wake-guard
+    # deliberately reports contention as unreadable rather than block. A
+    # dead controller also fails check 1's UNLOCKED read above, so the page
+    # still fires; a busy lock fails only here, and paging on it would cry
+    # wolf on every coincidence with rtc-save. Retrying blind would just
+    # contend harder.
+    *) wp_log "watch: alarm1 unreadable this tick (contention reads the same) — skipped; check 1 is the controller-death detector" ;;
+esac
+fi   # wp_watch_alarm_checked
+
+# ── 3. RTC plausibility ────────────────────────────────────────────────────
+if [ ! -e "$WP_WATCH_SYNCED" ]; then
+    wp_log "watch: clock not NTP-synced — skipping RTC plausibility"
+else
+    wp_watch_t=$(wp_rtc_read_confirmed)
+    wp_watch_rtc_rc=$?
+    if [ "$wp_watch_rtc_rc" = 0 ]; then
+        wp_watch_rtc_s=$(date -u -d "$wp_watch_t" +%s 2>/dev/null)
+        wp_watch_now_s=$(date -u +%s)
+        if [ -z "$wp_watch_rtc_s" ] || [ -z "$wp_watch_now_s" ]; then
+            wp_watch_hazard "RTC reads '$wp_watch_t' but the comparison against the system clock failed"
+        else
+            wp_watch_d=$(( wp_watch_now_s - wp_watch_rtc_s ))
+            [ "$wp_watch_d" -lt 0 ] && wp_watch_d=$(( -wp_watch_d ))
+            if [ "$wp_watch_d" -gt "$WP_WATCH_RTC_SLOP" ]; then
+                # The one check where Linux is the more trustworthy clock,
+                # and only here. We are past the synced-file gate, so the
+                # system clock has been set by NTP; the RTC is the thing
+                # disagreeing with it. That inverts the usual rule (the
+                # scheduler anchors on the RTC precisely because Linux may
+                # still be at systemd's floor) — which is why the correction
+                # is gated on the sync file and nowhere else in this script
+                # trusts `date` this way.
+                #
+                # wittypi-rtc-save is the unit that owns this write, it
+                # carries the same ConditionPathExists, and it verifies every
+                # field it writes. Its .path only fires when the sync file
+                # APPEARS, so a clock corrected long after that — or an RTC
+                # that drifts mid-uptime, e.g. a Control_1 register flip —
+                # has nothing to re-trigger it. This is that missing
+                # trigger.
+                if wp_watch_repair wittypi-rtc-save.service "an RTC ${wp_watch_d}s from the synced clock"; then
+                    # And re-arm afterwards, because correcting the clock
+                    # moves the appointments out from under the alarms. The
+                    # match window is two seconds wide and a missed alarm does
+                    # not fire late, it does not fire at all — so alarms armed
+                    # against the old RTC are wrong by exactly the correction,
+                    # and the schedule rewrite has to be ordered after it.
+                    #
+                    # Next tick, via a marker, not chained here. Both
+                    # requests are --no-block, so asking for both now is a
+                    # RACE: systemd orders neither against the other (the
+                    # scheduler is After= clock and configure, not rtc-save),
+                    # and the loser arms from the very clock we are correcting.
+                    # A marker defers the re-arm to a tick where the write has
+                    # long since landed, which is deterministic instead of
+                    # probable. It also closes the case a same-tick chain
+                    # cannot reach at all: an RTC running AHEAD leaves alarm2
+                    # in the FUTURE, which check 4 reads as perfectly healthy
+                    # and would never repair on its own.
+                    : > "$WP_WATCH_REARM_MARK" 2>/dev/null || true
+                    # And fence it against this tick. Check 3 runs BEFORE
+                    # check 4 in the same process, so without this the marker
+                    # is written here and consumed a few lines later — the
+                    # very same-tick race the marker exists to avoid, just
+                    # spelled differently. The fence makes "later tick" mean
+                    # later tick.
+                    WP_WATCH_REARM_FRESH=1
+                else
+                    WP_WATCH_RTC_SUSPECT=1
+                fi
+                wp_watch_hazard "RTC implausible: reads $wp_watch_t, ${wp_watch_d}s from the NTP-synced clock (bound ${WP_WATCH_RTC_SLOP}s) — a wake computed from Linux would MISS"
+            else
+                wp_log "watch: RTC agrees with the synced clock (${wp_watch_d}s)"
+            fi
+        fi
+    elif [ -n "$wp_watch_t" ]; then
+        wp_watch_hazard "RTC has lost power (year 00): reads $wp_watch_t — check the coin cell"
+    else
+        wp_watch_hazard "RTC could not be read consistently — no two consecutive reads agreed"
+    fi
+fi
+
+# ── 4. the schedule's shutdown appointment ─────────────────────────────────
+# Only where a schedule opts the node in — silent otherwise, so a bench or
+# hand-scheduled node never pages from a check about a config it doesn't run.
+#
+# Reads the alarm's four registers and validates the day exactly as every
+# other consumer does; sets wp_watch_a_ts (the firmware's own month-less
+# pseudo-timestamp: day*86400 + h*3600 + m*60 + s) and wp_watch_a_desc.
+# Returns 1 unreadable, 2 no valid appointment.
+wp_watch_alarm() {
+    wp_watch_as=$(wp_get_maybe_stable "$1") || return 1
+    wp_watch_am=$(wp_get_maybe_stable "$(( $1 + 1 ))") || return 1
+    wp_watch_ah=$(wp_get_maybe_stable "$(( $1 + 2 ))") || return 1
+    wp_watch_ad=$(wp_get_maybe_stable "$(( $1 + 3 ))") || return 1
+    wp_watch_add=$(wp_bcd2dec "$wp_watch_ad")
+    if [ "$wp_watch_add" -lt 1 ] || [ "$wp_watch_add" -gt 31 ]; then
+        return 2
+    fi
+    wp_watch_a_ts=$(( wp_watch_add * 86400 + $(wp_bcd2dec "$wp_watch_ah") * 3600 \
+                    + $(wp_bcd2dec "$wp_watch_am") * 60 + $(wp_bcd2dec "$wp_watch_as") ))
+    wp_watch_a_desc=$(printf 'day %02d at %02d:%02d:%02d UTC' "$wp_watch_add" \
+        "$(wp_bcd2dec "$wp_watch_ah")" "$(wp_bcd2dec "$wp_watch_am")" "$(wp_bcd2dec "$wp_watch_as")")
+    return 0
+}
+
+if [ -r "$WP_WATCH_SCHEDULE" ]; then
+    # The deferred re-arm check 3 asked for on an earlier tick. Consumed
+    # before the appointment is read, and the marker is cleared whether or
+    # not the request could be made — a marker that survives a refusal would
+    # ask again on every tick forever, which is the loop the attempt counter
+    # exists to prevent.
+    if [ -e "$WP_WATCH_REARM_MARK" ] && [ "$WP_WATCH_REARM_FRESH" = 0 ]; then
+        rm -f "$WP_WATCH_REARM_MARK" 2>/dev/null || true
+        wp_watch_repair wittypi-schedule.service "alarms armed against a clock that has since been corrected" || true
+    fi
+
+    wp_watch_alarm 32
+    case $? in
+        1) wp_log "watch: alarm2 unreadable this tick — schedule check skipped; check 1 is the controller-death detector" ;;
+        2) if wp_watch_repair wittypi-schedule.service "alarm2 holding no appointment"; then
+               wp_log "watch: a schedule is configured but alarm2 holds NO shutdown appointment — repair requested, verdict next tick"
+           else
+               wp_watch_hazard "a schedule is configured but alarm2 holds NO shutdown appointment — the node will not stop itself, and the scheduler could not be re-run; check wittypi-schedule.service"
+           fi ;;
+        0)
+            wp_watch_sched_desc=$wp_watch_a_desc
+            wp_watch_sched_ts=$wp_watch_a_ts
+            wp_watch_sn=$(wp_rtc_read_confirmed) || wp_watch_sn=''
+            if [ -z "$wp_watch_sn" ]; then
+                wp_log "watch: RTC unreadable — schedule-appointment check skipped"
+            else
+                # "now" on the same month-less basis the firmware compares on.
+                wp_watch_sn_ts=$(( $(wp_dec10 "$(printf '%s' "$wp_watch_sn" | cut -c9-10)") * 86400 \
+                                 + $(wp_dec10 "$(printf '%s' "$wp_watch_sn" | cut -c12-13)") * 3600 \
+                                 + $(wp_dec10 "$(printf '%s' "$wp_watch_sn" | cut -c15-16)") * 60 \
+                                 + $(wp_dec10 "$(printf '%s' "$wp_watch_sn" | cut -c18-19)") ))
+                wp_watch_over=$(( wp_watch_sn_ts - wp_watch_sched_ts ))
+                # Past = behind by more than the 2 s match window plus read
+                # slack, within half a month — beyond that the day-of-month
+                # has wrapped and the appointment is NEXT month's, i.e. future.
+                if [ "$wp_watch_over" -gt 5 ] && [ "$wp_watch_over" -le 1209600 ]; then
+                    # Two states, identical registers, opposite severities —
+                    # and the naive check pages the same way for both.
+                    #
+                    #   * The node was OFF while the appointment elapsed. The
+                    #     controller loses power with the rail on a bench
+                    #     unplug, so the alarm block keeps whatever it last
+                    #     held while the coin-cell RTC runs on. Re-plug days
+                    #     later and alarm2 is "days in the past" — a stale
+                    #     leftover, not a missed shutdown. Nothing is wrong,
+                    #     nothing is being drained, and the boot scheduler
+                    #     owns it. Paging here means a high-priority "the node
+                    #     will not stop itself" about a node that had only
+                    #     just been switched on.
+                    #   * The node was AWAKE and blew through it. THIS is the
+                    #     expensive one: every layer in this design pushes the
+                    #     node UP (alarm1's deferred re-fire, wake-guard,
+                    #     guaranteed wake) and none pushes it DOWN, so a node
+                    #     that misses its own shutdown has no automatic exit
+                    #     and flattens the pack.
+                    #
+                    # Uptime separates them exactly: if this node has been up
+                    # for less time than the appointment is overdue, it cannot
+                    # have been awake when the moment passed. Cheap, local, and
+                    # it is the difference between a page that means something
+                    # and one that teaches you to swipe alerts away.
+                    wp_watch_up=$(wp_watch_uptime) || wp_watch_up=''
+                    wp_watch_fixed=0
+                    wp_watch_repair wittypi-schedule.service \
+                        "alarm2 ${wp_watch_over}s past-dated" && wp_watch_fixed=1
+
+                    if [ -n "$wp_watch_up" ] && [ "$wp_watch_up" -lt "$wp_watch_over" ]; then
+                        if [ "$wp_watch_fixed" = 1 ]; then
+                            wp_log "watch: alarm2 ($wp_watch_sched_desc) is ${wp_watch_over}s past-dated, but this node has only been up ${wp_watch_up}s — it was OFF when that moment passed, so this is a stale leftover rather than a missed shutdown. Re-arm requested; verdict next tick"
+                        else
+                            wp_watch_hazard "alarm2 ($wp_watch_sched_desc) is a stale leftover from before this boot (up ${wp_watch_up}s, overdue ${wp_watch_over}s) and the scheduler could not be re-run — the node has no shutdown appointment; check wittypi-schedule.service"
+                        fi
+                    else
+                        # Awake through it, or uptime unreadable and we must
+                        # assume the worse of the two. Page EVEN IF the repair
+                        # was requested: the node has already been awake past
+                        # its window on a budget that assumed it would not be,
+                        # and that is worth knowing about whether or not the
+                        # next tick fixes it.
+                        wp_watch_hazard "a schedule is configured but alarm2 ($wp_watch_sched_desc) is ${wp_watch_over}s in the PAST and this node was AWAKE through it (up ${wp_watch_up:-unknown}s) — the scheduled shutdown did NOT happen and nothing in this design stops a node that stays up$([ "$wp_watch_fixed" = 1 ] && printf '; re-arm requested' || printf '; re-arm NOT possible')"
+                    fi
+                else
+                    wp_log "watch: alarm2 armed for $wp_watch_sched_desc"
+                fi
+                # Alarm1 in the past is LOG-ONLY: the MCU defers a wake that
+                # fired while up and re-fires it ~4 s after the next
+                # power-off (reason 8), so this state heals itself.
+                if wp_watch_alarm 27; then
+                    wp_watch_over1=$(( wp_watch_sn_ts - wp_watch_a_ts ))
+                    if [ "$wp_watch_over1" -gt 5 ] && [ "$wp_watch_over1" -le 1209600 ]; then
+                        wp_log "watch: alarm1 ($wp_watch_a_desc) is in the past — the MCU will re-fire it ~4s after the next power-off; the scheduler renews it at boot"
+                    fi
+                fi
+            fi
+            ;;
+    esac
+fi
+
+[ "$WP_WATCH_HAZARDS" -eq 0 ] && exit 0
+wp_log "watch: $WP_WATCH_HAZARDS hazard(s) this tick — see $WP_WATCH_RECORD"
+exit 1

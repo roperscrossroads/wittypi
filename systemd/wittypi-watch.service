@@ -1,0 +1,81 @@
+[Unit]
+Description=Periodic read-only check that nothing load-bearing has drifted
+Documentation=file:///usr/libexec/site/wittypi-watch
+
+# After=wake-guard.service is a STOP-order directive, and the direction is the
+# whole point. systemd stops units in the inverse of their start order: "if a
+# unit is configured with After= on another unit, the former is stopped before
+# the latter" (systemd.unit(5)). So THIS unit is stopped — its mid-flight tick
+# SIGTERMed, dead in milliseconds, the kernel releasing any fd it held —
+# BEFORE wake-guard.service's ExecStop runs the one arming that matters.
+#
+# Before=wake-guard.service is the intuitive choice, reasoning from the
+# boot-time wittypi-clock -> wittypi-configure precedent — but that pair races
+# at START, and this pair races at STOP, where the ordering inverts. Before=
+# here would do the opposite of what it was chosen for: wake-guard's ExecStop
+# would run FIRST, while a supervisor tick could still be mid-read — and
+# worse, mid-`wake-guard check`, HOLDING the I2C lock that `ensure`'s 1 s wait
+# then times out against, proceeding to power off with nothing armed. That is
+# the one interleaving this ordering must make impossible.
+# tests/cases/wittypi-watch.sh pins the direction with a negative assertion
+# so a well-meaning "fix" back to Before= fails the suite.
+#
+# At start the direction is harmless: wake-guard's ExecStart is /bin/true,
+# and the first tick is OnBootSec=10min away regardless.
+After=wittypi.service wake-guard.service
+
+# NOT RequiresMountsFor=/data: everything this script wants from /data (the
+# env file, the hazard record) is best-effort by construction — a node whose
+# /data failed to mount still deserves its controller supervised, arguably
+# more than a healthy one.
+After=data.mount
+
+# Stopped early in a shutdown transition, same idiom as wake-guard.service.
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+# The last outcome stays visible in `systemctl status wittypi-watch` between
+# ticks: exit 0 = clean, a hazard exits 1 and the unit shows failed — that is
+# the point, not a nuisance (the timer fires again regardless; OnUnitActiveSec
+# counts from activation, not from success).
+# No RemainAfterExit, and the absence is load-bearing. OnUnitActiveSec= re-arms
+# relative to the unit's last activation, and systemd never re-triggers a unit
+# that is still active — so RemainAfterExit=yes would keep this unit active
+# forever and the timer would fire at boot+10min and then never again. The
+# failure is near-invisible on a node that reboots often, because every boot
+# produces a fresh tick; it only shows on a long uptime, which is precisely the
+# window this supervisor exists for. The last verdict therefore lives in the
+# journal (journalctl -u wittypi-watch) rather than in systemctl status — a
+# small loss, paid for actually ticking. tests/cases/wittypi-watch.sh pins the
+# directive absent.
+TimeoutStartSec=10
+
+# 1 s, and it is part of the power-cut budget — the term this unit adds to the
+# shutdown sum in the coincidence case (a shutdown racing a tick: this stop,
+# THEN wake-guard's ExecStop, serialised by the ordering above). timing-windows
+# reads this number straight out of this file, so the budget it reports and the
+# value systemd enforces cannot drift apart. The script is trap-free and
+# read-only — SIGTERM kills it in milliseconds with nothing to clean up (a test
+# asserts no trap ever appears) — so 1 s is a 10x bound on reality, and every
+# extra second here is a second stolen from the same budget that unmounts
+# /data.
+TimeoutStopSec=1
+
+# The same site file wittypi-configure reads, so the watch compares register
+# 49 against the SAME intent the boot applied — not a second, driftable copy.
+# Optional (-): an unconfigured node still gets the readable-and-enabled
+# check, which is the load-bearing half.
+EnvironmentFile=-/data/wittypi.env
+ExecStart=/usr/libexec/site/wittypi-watch
+
+# Exit 1 is "hazard found and reported" — the unit showing failed is the
+# visibility, not a malfunction. Nothing downstream depends on this unit
+# succeeding, and the timer is unaffected either way.
+StandardOutput=journal
+StandardError=journal
+
+# No [Install]: wittypi-watch.timer starts this. Enabling the service too
+# would run one useless check at boot exactly when the bus is busiest —
+# the same reasoning as wittypi-rtc-save.service, which its .path starts.

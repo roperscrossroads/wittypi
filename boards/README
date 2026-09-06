@@ -1,0 +1,35 @@
+# The board-calibration registry
+
+One file per physical board, named `<board-id>.env`, shipped verbatim into
+the image at `/usr/lib/site/wittypi-boards/`. At `wittypi configure`/`check`
+time (and in `wittypi-watch`'s comparisons) the board resolves its own id —
+the Pi's `/proc/cpuinfo` serial with leading zeros stripped, falling back to
+the wlan0 MAC with colons stripped — and applies its file's `WITTYPI_*`
+assignments for any variable the environment leaves unset.
+
+WHY: register 37 (RTC_OFFSET) is a measured property of one crystal and a
+firmware flash erases it for good; the ADJ registers (24-26) calibrate one
+board's ADC. Before this registry those numbers lived only in the HAT's own
+EEPROM and one SD card's /data — lost to an MCU flash and a card reflash
+respectively, and wrong if a card moves between boards. Here, git is the
+backup UUGear tell you to keep by hand, and any card on a known board gets
+that board's trims.
+
+RULES:
+  * /data/wittypi.env ALWAYS WINS — the registry fills gaps, never
+    overrides. "Set but empty" counts as set.
+  * Calibration only, by convention: registers 37 and 24-26. Policy
+    (delays, temperatures, guaranteed wake) belongs in /data/wittypi.env or
+    the compiled defaults, where every board reads the same intent.
+  * Only `WITTYPI_*=value` lines are honoured; everything else is logged
+    and skipped.
+  * The id names the PI; the trims belong to the HAT (nothing unique is
+    readable over I2C on a Witty Pi 4). Pi and HAT are treated as a bonded
+    pair — if a HAT ever moves between Pis, RENAME its file to the new
+    board's id in the same change.
+
+To register a board: boot it, read the trims off the live HAT —
+    wittypi get RTC_OFFSET; wittypi get ADJ_VIN
+    wittypi get ADJ_VOUT;   wittypi get ADJ_IOUT
+— confirm register 56 (the live offset) agrees with 37, find the id with
+`sed -n 's/^Serial\s*:\s*0*//p' /proc/cpuinfo`, and commit a new file here.

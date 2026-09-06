@@ -1,0 +1,202 @@
+#!/bin/sh
+# The bounded pre-shutdown gate — WITTYPI.md, "Design pattern" layer 2.
+#
+# THE PROBLEM THIS SOLVES
+# -----------------------
+# If you're running an A/B update mechanism that gates "mark this slot good"
+# behind a boot-health soak, and your awake window is shorter than that soak,
+# the slot never gets marked good, its boot-attempt counter decrements every
+# cycle, and after enough cycles it's declared bad and the board fails over —
+# then does the same to the other slot. Both condemned, board down, nothing
+# actually wrong. See WITTYPI.md's "Design pattern" section for the full
+# argument.
+#
+# A correctly-sized awake window (layer 1) is what's *supposed* to prevent
+# that. This script is what happens when layer 1's arithmetic was wrong: a
+# slow boot, an fsck, a soak that started later than expected.
+#
+# WHY THE DEADLINE IS THE WHOLE DESIGN
+# -------------------------------------
+# The controller has its own timeout-based forced power cut, independent of
+# this script (see WITTYPI.md, "The three facts that shape everything") —
+# the rail drops POWER_CUT_DELAY after the shutdown request regardless of
+# what this script does. So a hang here can't strand the board forever; it
+# can, however, eat into the budget that Linux's own shutdown sequence needs
+# to finish cleanly. That's the failure mode this design guards against:
+#
+#   * the deadline is computed ONCE, before the loop
+#   * it is computed from a MONOTONIC clock
+#   * nothing observed inside the loop can extend it
+#   * expiry RETURNS, it does not keep waiting
+#
+# This is the general shape of an unbounded-gate bug: a heartbeat or a
+# health signal that keeps proving "still working" can postpone a deadline
+# indefinitely if the deadline is re-derived from anything the loop
+# observes. Here it isn't a bug to fix, it's a property to design around
+# from the start.
+#
+# WHY /proc/uptime AND NOT date(1)
+# --------------------------------
+# `date +%s` is wall clock, and the wall clock can move during the window
+# this loop runs in — an RTC-backed controller writes RTC time into the
+# system clock at startup, and NTP may step it again once the network is up.
+# A deadline built on wall clock could be jumped past (harmless) or pushed
+# away (not harmless — it's exactly the unbounded wait this design exists to
+# prevent). /proc/uptime is CLOCK_MONOTONIC and immune to both.
+#
+# THE TRADE, STATED PLAINLY
+# -------------------------
+# An un-marked slot costs one boot attempt out of however many your update
+# mechanism budgets, and the next boot's soak will likely complete and reset
+# the counter. A held rail costs the whole battery, and on a solar-powered
+# board that's unrecoverable until the panel produces again. The cheap
+# failure is chosen deliberately; the expensive one is logged.
+
+set -u
+
+WP_LIB="${WITTYPI_LIB:-/usr/libexec/site/wittypi-lib.sh}"
+# shellcheck source=/dev/null
+. "$WP_LIB"
+
+# ── The grace shares one budget with the shutdown itself ───────────────────
+# Everything after the shutdown request — this wait, plus the whole of Linux
+# shutting down — has to fit inside POWER_CUT_DELAY (register 21), because
+# the controller starts its own power-cut countdown at the request and cuts
+# the rail that many seconds later regardless of what's still running.
+#
+#   POWER_CUT_DELAY (register 21)         your configured value
+#   your measured shutdown duration       measure this
+#   ------------------------------------------
+#   headroom available for this wait      the remainder
+#
+# Pick a grace comfortably smaller than that remainder — not all of it — so a
+# shutdown that runs slightly longer than measured still fits. The
+# relationship is the opposite of the intuitive one: a *slower* shutdown
+# makes a *larger* grace more dangerous, not safer, because it eats directly
+# into the same shared budget. If you want more headroom, raise
+# POWER_CUT_DELAY itself (see WITTYPI-SETTINGS.md §1) rather than shrinking
+# this wait — that needs no code change, just a site config update.
+#
+# Also be clear about what waiting buys: often very little. If your
+# health-check soak takes minutes and your shutdown-triggering alarm fires on
+# a much shorter cycle, waiting can only convert a miss into a hit in the
+# narrow case where the soak was about to finish anyway. This value should be
+# chosen so the gate doesn't *hurt* — so a miss gets recorded rather than the
+# rail being cut mid-wait, destroying the only evidence a miss happened. What
+# actually protects your boot-attempt counters is layer 1: an awake window
+# that comfortably exceeds boot-plus-soak.
+WP_GRACE="${WITTYPI_MARKGOOD_GRACE:-8}"
+
+# DATA_DIR and PROC_UPTIME are overridable ONLY for the test suite; the
+# defaults are the production values.
+WP_DATA="${DATA_DIR:-/data}"
+WP_UPTIME_FILE="${PROC_UPTIME:-/proc/uptime}"
+WP_RECORD="${WITTYPI_MARKGOOD_RECORD:-$WP_DATA/wittypi-markgood-missed}"
+
+# ── Urgent reasons are NOT gated ───────────────────────────────────────────
+# Low voltage and the thermal trips are the controller protecting the
+# hardware. Delaying them to tidy up application state is the wrong trade —
+# and because every shutdown reason comes through the same firmware path
+# (they all request a graceful shutdown, not an immediate cut), an ungated
+# wait here would not merely postpone a scheduled sleep, it would defeat the
+# low-voltage protection while the battery drains. Reading the action-reason
+# register is what makes the distinction possible at all.
+WP_REASON="${WITTYPI_REASON:-}"
+if [ -z "$WP_REASON" ]; then
+    WP_REASON=$(wp_get "$WP_REG_ACTION_REASON") || WP_REASON=""
+fi
+
+case "$WP_REASON" in
+    "$WP_REASON_LOW_VOLTAGE"|"$WP_REASON_OVER_TEMPERATURE"|"$WP_REASON_BELOW_TEMPERATURE")
+        wp_log "reason $WP_REASON is urgent (voltage/thermal) — not gating, returning now"
+        exit 0 ;;
+esac
+
+# ── Is the booted slot already good? ───────────────────────────────────────
+# This example checks two common A/B-update signals: a `boot-complete.target`
+# that a health-check unit gates, and `rauc status` directly if RAUC is in
+# use. Either is sufficient — this loop is trying to establish that waiting
+# longer is pointless, and a false "yes" only costs the boot attempt that
+# the timeout would have cost anyway. Adapt the checks inside
+# `wp_slot_is_good` to whatever your own update mechanism exposes.
+#
+# ── And if this system has no A/B mechanism at all ─────────────────────────
+# Both signals above are optional software. On a system with neither, this
+# must NOT read as "the slot is not yet good" — that would make this loop
+# wait out the full grace on every single shutdown, for a mark-good that's
+# never coming. Detect the absence of both mechanisms explicitly and return
+# immediately in that case; a real A/B system whose soak genuinely hasn't
+# finished must still wait, so don't let this collapse into "always skip".
+wp_ab_present() {
+    command -v rauc >/dev/null 2>&1 && return 0
+    systemctl list-unit-files boot-complete.target >/dev/null 2>&1
+}
+
+wp_slot_is_good() {
+    if systemctl is-active --quiet boot-complete.target 2>/dev/null; then
+        return 0
+    fi
+    if rauc status 2>/dev/null | grep -qi 'boot status: *good'; then
+        return 0
+    fi
+    if ! wp_ab_present; then
+        wp_log "no A/B update mechanism on this system — no mark-good to wait for"
+        return 0
+    fi
+    return 1
+}
+
+if wp_slot_is_good; then
+    wp_log "booted slot already marked good — nothing to wait for"
+    exit 0
+fi
+
+# ── The deadline. Computed ONCE. ───────────────────────────────────────────
+# Integer seconds: /proc/uptime is "SECONDS.HH IDLE", and cutting at the dot
+# avoids needing float arithmetic the shell doesn't have.
+wp_now() {
+    cut -d' ' -f1 "$WP_UPTIME_FILE" | cut -d. -f1
+}
+
+wp_deadline=$(( $(wp_now) + WP_GRACE ))
+wp_log "waiting up to ${WP_GRACE}s for mark-good (reason $WP_REASON)"
+
+# ── The last sleep is clamped to what's left, and that is not a detail ─────
+# An unconditional `sleep 5` between polls would let the loop exit on the
+# first poll *at or past* the deadline, not at it — a grace of 8 could wait
+# 10, silently borrowing 2 extra seconds from the shared shutdown budget
+# above. The header already claims "a deadline computed once, that nothing
+# can extend" — an unclamped poll interval would quietly violate that claim.
+# The clamp bounds the wait by construction rather than by whatever the
+# budget happens to be at any given time.
+while :; do
+    wp_left=$(( wp_deadline - $(wp_now) ))
+    [ "$wp_left" -gt 0 ] || break
+    if wp_slot_is_good; then
+        wp_log "slot marked good — releasing shutdown"
+        exit 0
+    fi
+    if [ "$wp_left" -gt 5 ]; then
+        sleep 5
+    else
+        sleep "$wp_left"
+    fi
+done
+
+# ── Expired. Record it and RETURN ANYWAY. ──────────────────────────────────
+# The record is the only way anyone learns this happened: the board is about
+# to lose power, so a line in a volatile journal doesn't survive. Persistent
+# storage is the one writable filesystem — if it's missing or read-only for
+# some other reason, the write is simply lost, which is acceptable, because
+# nothing here is allowed to stop the return.
+wp_log "grace expired after ${WP_GRACE}s — slot NOT marked good. This costs one \
+boot attempt; the next boot's soak should reset the counter if it completes."
+
+{
+    printf '%s uptime=%s reason=%s grace=%s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)" \
+        "$(wp_now)" "$WP_REASON" "$WP_GRACE"
+} >> "$WP_RECORD" 2>/dev/null || \
+    wp_log "could not record the miss to $WP_RECORD"
+
+exit 0

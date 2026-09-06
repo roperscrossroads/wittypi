@@ -1,0 +1,220 @@
+#!/bin/sh
+# wittypi-shutdown-gate — arm a wake before a human-ordered shutdown proceeds.
+#
+# The integrator wires /usr/sbin/{poweroff,halt,shutdown} as symlinks to THIS
+# script, preserving systemd's originals as <name>.real alongside. A typed
+# `systemctl poweroff` arrives here too, via the /etc/profile.d function,
+# carrying the original systemctl argv with this script's own name as $0.
+#
+# Why, when wake-guard.service already arms on every transition
+# --------------------------------------------------------------
+# The ExecStop rescue runs MID-transition: the network may already be torn
+# down (so its failure page goes nowhere), its verdict lands in a journal on a
+# node that is about to lose power, and TimeoutStopSec can kill it mid-write,
+# leaving a half-written alarm. This gate runs BEFORE the transition starts:
+# the wake is armed while the network is still up, the verdict prints on the
+# terminal of the human who ordered the shutdown, and a failure can still
+# page. The ExecStop stays as the backstop for every path that does not come
+# through here — the two layers are belt and braces, not duplication. A side
+# effect worth having: by the time the transition runs the alarm is already
+# armed, so the in-budget ExecStop takes its fast already-armed path (~1 s),
+# not the ~2.6 s arming path.
+#
+# Arm-then-proceed, never refuse. On a battery- or solar-powered node a
+# shutdown with no wake armed is dark until GUARANTEED_WAKE (26 h) or a site
+# visit. But a gate that can BLOCK a shutdown is worse — a node that stays up
+# on a flat battery because a nicety failed. So every branch below ends in the
+# shutdown happening; the only question is how loudly.
+#
+# One `wake-guard ensure`, not check-then-ensure. Calling `check` first and
+# dispatching on its tri-state is two lock acquisitions with a window between
+# them; `ensure` alone IS the tri-state, entered atomically under wake-guard's
+# own flock, and it already prints the same human-readable verdict check would
+# have ("wake already armed: day …" / "armed fallback wake for …"). Its exit
+# code carries the dispatch:
+#     0  a wake is armed — found, or just armed. Proceed quietly.
+#     2  controller unreadable (or lock contention) — proceed LOUDLY + page.
+#     *  nothing armed and arming FAILED — proceed LOUDLY + page.
+#
+# The SysV parse, and why it exists. systemctl invoked as `shutdown` speaks
+# shutdown(8): -h/-P/-H halt or power off, -r reboots, -c cancels, -k warns
+# without acting, a time argument, a wall message. `reboot` is deliberately
+# ungated — a clean reboot never trips the MCU's rail-cut detection — so a
+# `shutdown -r` must pass ungated too, and a `shutdown -c` MUST pass untouched,
+# because arming for a cancellation is nonsense and translating one into
+# anything else would be dangerous. The rule when parsing runs out: GATE. An
+# unneeded arm costs ~2.6 s and one alarm that wake-guard's readers all
+# validate; a missed arm costs a site visit. (SysV `shutdown -f` means
+# skip-fsck-on-reboot, NOT force — it does not bypass this gate. poweroff and
+# halt's -f/--force DOES: that flag is what a human reaches for on a wedged
+# box, and adding I2C work there is wrong — the bypass passes -f through
+# untouched, so both meanings are served.)
+#
+# Proceeding means exec <name>.real, not `systemctl <verb>`. systemctl's SysV
+# personality lives in argv[0] (invoked_as() matches the last path component by
+# SUBSTRING — deliberately, to support exactly this kind of rename), and POSIX
+# sh cannot set argv[0] on exec. Re-invoking the preserved symlink keeps every
+# flag, time argument, wall message and cancellation working exactly as before
+# the gate existed. The verb translation below it is a defensive fallback for
+# an image whose symlink wiring broke — dumb but safe, and it refuses the cases
+# (-c, -k, --help) where a translation would turn a no-op into a power cut.
+#
+# WITTYPI_SHUTDOWN_FORCE=1 skips the wake check without touching the
+# command — the explicit bypass for bench work where -f's forced-shutdown
+# semantics are not wanted.
+#
+# Overridable paths mirror wittypi-watch's test seams: the offline suite
+# points these into a fixture; the shipped image runs the defaults.
+set -u
+
+GATE_WAKE_GUARD="${WITTYPI_SHUTDOWN_GATE_WAKE_GUARD:-/usr/libexec/site/wake-guard}"
+GATE_NOTIFY="${WITTYPI_SHUTDOWN_GATE_NOTIFY:-/usr/bin/notify}"
+GATE_REAL_DIR="${WITTYPI_SHUTDOWN_GATE_REAL_DIR:-/usr/sbin}"
+GATE_SYSTEMCTL="${WITTYPI_SHUTDOWN_GATE_SYSTEMCTL:-/usr/bin/systemctl}"
+
+log() { printf 'wittypi-shutdown-gate: %s\n' "$*" >&2; }
+
+gate_name="${0##*/}"
+
+# GATE_DECISION: gate (arm, then proceed) | pass (not a power cut — through
+# untouched) | bypass (a power cut, explicitly unchecked — through untouched).
+# GATE_FALLBACK: the systemctl verb the defensive fallback may use if the
+# .real symlink is missing. EMPTY whenever the invocation is not a power cut
+# — translating a --help or a -c into a poweroff is the one thing the
+# fallback must never do.
+
+decide_poweroff_halt() {
+    GATE_FALLBACK="$1"; shift
+    GATE_DECISION=gate
+    for _a in "$@"; do
+        case "$_a" in
+            --help|--wtmp-only) GATE_DECISION=pass; GATE_FALLBACK=; return ;;
+            --force)            GATE_DECISION=bypass ;;
+            --*)                ;;
+            -*w*)               GATE_DECISION=pass; GATE_FALLBACK=; return ;;
+            -*f*)               GATE_DECISION=bypass ;;
+        esac
+    done
+}
+
+decide_shutdown() {
+    GATE_DECISION=gate
+    GATE_FALLBACK=poweroff
+    _r=0; _hp=0
+    for _a in "$@"; do
+        case "$_a" in
+            --) break ;;
+            --help)            GATE_DECISION=pass; GATE_FALLBACK=; return ;;
+            --halt|--poweroff) _hp=1 ;;
+            --reboot)          _r=1 ;;
+            --*)               ;;
+            -*c*|-*k*)         GATE_DECISION=pass; GATE_FALLBACK=; return ;;
+            -*h*|-*H*|-*P*)    _hp=1 ;;
+            -*r*)              _r=1 ;;
+            -?*)               ;;
+            # The first non-option argument is the TIME; a wall message may
+            # follow and its words may start with '-'. Stop parsing here —
+            # anything ambiguous after this point falls to the default: gate.
+            *) break ;;
+        esac
+    done
+    if [ "$_r" = 1 ] && [ "$_hp" = 0 ]; then
+        GATE_DECISION=pass
+        GATE_FALLBACK=reboot
+    fi
+}
+
+# The profile.d layer calls this script by name with the ORIGINAL systemctl
+# argv. Only the verb position decides (systemctl's grammar: options, then
+# the command) — `systemctl status halt` names a unit, not a shutdown.
+decide_verb() {
+    GATE_DECISION=pass
+    GATE_FALLBACK=
+    _verb=; _force=0
+    for _a in "$@"; do
+        case "$_a" in
+            -f|-ff|--force) _force=1 ;;
+            -*)             ;;
+            *)              [ -z "$_verb" ] && _verb="$_a" ;;
+        esac
+    done
+    case "$_verb" in
+        poweroff|halt)
+            GATE_DECISION=gate
+            GATE_FALLBACK=$_verb
+            [ "$_force" = 1 ] && GATE_DECISION=bypass
+            ;;
+    esac
+}
+
+case "$gate_name" in
+    poweroff|halt)       decide_poweroff_halt "$gate_name" "$@" ;;
+    shutdown)            decide_shutdown "$@" ;;
+    wittypi-shutdown-gate) decide_verb "$@" ;;
+    *)
+        # A name this gate does not serve is a misconfiguration to surface,
+        # not to guess around — if a future postprocess pointed `reboot`
+        # here, endorsing it silently would gate the one verb the design
+        # says must stay ungated. Exiting cannot leave the node dark; it
+        # leaves a human at a terminal with a loud error.
+        printf 'wittypi-shutdown-gate: invoked as %s — this gate serves poweroff, halt, shutdown, or its own name with a systemctl verb\n' "$gate_name" >&2
+        exit 64
+        ;;
+esac
+
+if [ "${WITTYPI_SHUTDOWN_FORCE:-0}" = "1" ] && [ "$GATE_DECISION" = gate ]; then
+    GATE_DECISION=bypass
+fi
+
+if [ "$GATE_DECISION" = gate ] && [ ! -x "$GATE_WAKE_GUARD" ]; then
+    # No wake-guard on this system. Not a failure to arm — nothing to arm
+    # with. Distinguished from rc 127 below because "arming FAILED" sends you
+    # looking at the I2C bus for a fault that is not there.
+    log "PROCEEDING UNGUARDED: no wake-guard installed at $GATE_WAKE_GUARD."
+    log "Nothing will arm alarm1. Only guaranteed-wake (26 h) or the button brings this node back."
+    log "Supply one with WITTYPI_SHUTDOWN_GATE_WAKE_GUARD if this node runs on battery."
+    GATE_DECISION=bypass
+fi
+
+if [ "$GATE_DECISION" = gate ]; then
+    "$GATE_WAKE_GUARD" ensure
+    _rc=$?
+    case $_rc in
+        0) ;; # armed — found or just written; wake-guard's own line said which
+        2)
+            log "PROCEEDING UNGUARDED: the controller could not be read — wake state unknown."
+            log "If this node has a Witty Pi, only guaranteed-wake (26 h) or the button brings it back."
+            "$GATE_NOTIFY" -t "wittypi shutdown gate" -p high -g warning \
+                "shutting down with the controller unreadable — wake state unknown" \
+                >/dev/null 2>&1 || true
+            ;;
+        *)
+            log "PROCEEDING UNGUARDED: no wake is armed and arming FAILED (wake-guard rc $_rc)."
+            log "Only guaranteed-wake (26 h) or the button brings this node back."
+            "$GATE_NOTIFY" -t "wittypi shutdown gate" -p high -g warning \
+                "shutting down with NO wake armed — arming failed (wake-guard rc $_rc)" \
+                >/dev/null 2>&1 || true
+            ;;
+    esac
+elif [ "$GATE_DECISION" = bypass ]; then
+    log "force — proceeding without the wake check"
+fi
+
+if [ "$gate_name" = "wittypi-shutdown-gate" ]; then
+    exec "$GATE_SYSTEMCTL" "$@"
+fi
+
+gate_real="$GATE_REAL_DIR/$gate_name.real"
+if [ -x "$gate_real" ]; then
+    exec "$gate_real" "$@"
+fi
+
+# Defensive only: the postprocess guarantees the .real exists and bb.fatals
+# if it cannot. If it is somehow gone, a dumb verb still beats a node that
+# cannot power off — except where no verb is safe (see GATE_FALLBACK above).
+if [ -n "$GATE_FALLBACK" ]; then
+    log "$gate_real is MISSING — falling back to '$GATE_SYSTEMCTL $GATE_FALLBACK' (argument details lost)"
+    exec "$GATE_SYSTEMCTL" "$GATE_FALLBACK"
+fi
+log "cannot honor '$gate_name $*': $gate_real is missing and no verb translation is safe for it"
+exit 1

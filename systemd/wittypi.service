@@ -1,0 +1,36 @@
+[Unit]
+Description=Witty Pi 4 power sequencing
+
+# Needs /dev/i2c-* and the GPIO character device, both of which should exist
+# by basic.target. Don't order this after any late-boot health-check target —
+# the SYS_UP handshake needs to reach the MCU early, well before a health
+# soak (if you're running one) would complete.
+After=basic.target
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/site/wittypi-daemon
+
+# ── Restart, because the expensive failure is silence ──────────────────────
+# This unit is the only thing that turns the MCU's shutdown request into a
+# graceful shutdown.
+#
+# The controller has its own timeout-based forced cut independent of this
+# daemon (see WITTYPI.md, "The three facts that shape everything") — the
+# rail drops POWER_CUT_DELAY after the request whether or not anything on
+# the Pi side answers. So a dead daemon does not leave the rail held up
+# indefinitely.
+#
+# Restart is still worth having, for a smaller but real reason: a dead
+# daemon means the power-cut delay can expire with Linux still running, so
+# persistent storage is cut mid-write and any shutdown-time bookkeeping never
+# runs. Ungraceful rather than catastrophic — but a restart loop is noisy and
+# visible in the journal, and restarting costs nothing here.
+#
+# Exit 0 is deliberate and must NOT restart: it's how the daemon reports "no
+# controller fitted", which is a normal bench configuration.
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

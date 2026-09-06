@@ -1,0 +1,22 @@
+[Unit]
+Description=Run the Witty Pi supervisor every 15 minutes
+Documentation=file:///usr/libexec/site/wittypi-watch
+
+[Timer]
+# 10min, not at boot: there is nothing worth checking right after boot —
+# wittypi-configure just re-asserted the register policy, wittypi-clock just
+# set the clock from the RTC, and wake-guard's state was just established.
+# A boot-time tick would add I2C traffic exactly when the bus is busiest and
+# could only confirm what the boot sequence already logged.
+OnBootSec=10min
+OnUnitActiveSec=15min
+
+# Persistent=false, deliberately. After a long sleep there is no missed-check
+# backlog worth firing: the node was OFF, nothing could have drifted in a
+# powered-down EEPROM that the boot sequence won't re-assert anyway, and
+# Persistent=true would fire the "missed" tick at exactly the busiest moment
+# of boot — the same reasoning as OnBootSec above.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

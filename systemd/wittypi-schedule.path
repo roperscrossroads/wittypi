@@ -1,0 +1,52 @@
+[Unit]
+Description=Re-arm the duty cycle when the schedule config appears or changes
+Documentation=file:///usr/libexec/site/wittypi-schedule
+
+# ── Why this exists ────────────────────────────────────────────────────────
+# wittypi-schedule reads /data/wittypi-schedule.env exactly ONCE, at boot. So
+# writing that file on a running node did nothing at all until the next
+# reboot: the scheduler had already taken its "hand-scheduled mode, nothing to
+# renew" exit, and nothing re-read the file. Meanwhile wittypi-watch checks the
+# SAME path at tick time, so from the moment the file existed the node looked
+# configured to the supervisor while its alarm block still held whatever it
+# held before. A node that believes it has a duty cycle and has not armed one.
+#
+# A .path unit watches the file rather than sampling it once — the same idiom,
+# and the same reasoning, as wittypi-rtc-save.path.
+#
+# Safe only because the scheduler is idempotent. It anchors its appointments on
+# absolute cycle phase, so re-running it mid-window recomputes the SAME two
+# instants. Under a `now + ON_SEC` anchor every trigger here would instead push
+# the shutdown further out, and an editor that saves twice would quietly
+# redefine the duty cycle. If that anchor is ever changed, delete this unit in
+# the same commit.
+RequiresMountsFor=/data
+After=data.mount
+
+[Path]
+# PathChanged, not PathExists: this must fire both when the file first APPEARS
+# (the case that cost a node its duty cycle) and when it is EDITED to change
+# the cadence. PathChanged watches the parent directory while the file is
+# absent, so a create-and-close is caught, and it triggers on close-after-write
+# rather than on every intermediate write of an editor's save.
+PathChanged=/data/wittypi-schedule.env
+
+# Not Unit=wittypi-schedule.service — read this before "simplifying" it.
+# systemd does not re-trigger a path unit whose target service is still
+# active, and wittypi-schedule.service is RemainAfterExit=yes: after its boot
+# run it stays `active` forever. Pointed straight at it, this .path would fire
+# ONCE, at most, and then never again — silently, with no error anywhere.
+#
+# That is not hypothetical: it is the same shape as the RemainAfterExit bug
+# that once left wittypi-watch ticking only at boot, invisible because every
+# reboot produced a fresh tick.
+#
+# The wrapper below is Type=oneshot WITHOUT RemainAfterExit, so it returns to
+# inactive after every run and this unit can trigger again. It exists solely to
+# hold that property; the alternative was dropping RemainAfterExit from the
+# scheduler, which would give up the "verdict stays visible in systemctl
+# status" property that unit deliberately has.
+Unit=wittypi-reschedule.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,51 @@
+[Unit]
+Description=Re-run the duty-cycle scheduler after a config change
+Documentation=file:///usr/libexec/site/wittypi-schedule
+
+# ── A wrapper, and it exists for one property ──────────────────────────────
+# wittypi-schedule.path cannot point at wittypi-schedule.service directly:
+# systemd will not re-trigger a path unit whose service is still active, and
+# that service is RemainAfterExit=yes, so it is active from its boot run
+# onwards. The .path would fire once and then never again, silently.
+#
+# This unit is Type=oneshot with NO RemainAfterExit, so it goes back to
+# inactive the moment it finishes and the .path can trigger on the next change.
+# It does nothing else. See wittypi-schedule.path for the full derivation.
+
+# Stopped early in a shutdown transition, same idiom as every other unit here,
+# and it must never race the arming ExecStop that matters.
+After=wake-guard.service
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+
+# No RemainAfterExit — that is the entire point of this file. A test pins it
+# absent, because adding it would silently reintroduce the one-shot-forever
+# bug this wrapper exists to avoid.
+
+# restart, not start. wittypi-schedule.service is RemainAfterExit=yes, so
+# `start` on it is a no-op whenever it is already active — which is always,
+# after boot. The same trap, one level down.
+#
+# And not --no-block. Unlike wittypi-watch's repair path — which fires from a
+# supervisor tick with a 10 s budget and reads its verdict on a later tick —
+# nothing here is on a clock, and blocking means this unit's own status
+# reflects whether the re-arm actually worked. TimeoutStartSec below covers
+# the scheduler's full 60 s.
+ExecStart=/usr/bin/systemctl restart wittypi-schedule.service
+
+# The scheduler allows itself 60 s (flock wait + controller probe + RTC
+# retries + arming); waiting on it needs at least as long, plus slack.
+TimeoutStartSec=75
+
+StandardOutput=journal
+StandardError=journal
+
+# ── No [Install]: this is triggered, not enabled ───────────────────────────
+# wittypi-schedule.path is what pulls it in. Enabling it as well would re-run
+# the scheduler at every boot, moments after wittypi-schedule.service already
+# ran — pure duplicated I2C traffic at the busiest point of boot. The same
+# arrangement, and the same reasoning, as wittypi-rtc-save.service and its
+# .path.

@@ -1,0 +1,132 @@
+# timing-terms — the constants this repo cannot compute, in one place.
+#
+# ── Why a data file and not a copy in every script that needs one ──────────
+# Most timing constants here are READ FROM THE CODE THAT USES THEM — the
+# power-cut budget out of the policy script, a unit's stop budget out of the
+# unit. Those cannot drift, because there is nothing to drift FROM: the reader
+# and the user of the value are the same file.
+#
+# Two classes of constant do not work that way:
+#
+#   MEASURED   — how long the hardware actually takes. Not derivable from any
+#                source in this tree. It comes from a stopwatch.
+#   FIRMWARE   — compiled into the controller's AVR binary. Not in this repo,
+#                not on the node, and not readable over I2C.
+#
+# Pasted into whichever script needs them, those go stale in one copy and not
+# the other, with at best a comment promising the two will be compared. A
+# promise is not a mechanism. So: ONE file, read by the offline tests, read by
+# timing-windows, and shipped to the node verbatim so the node reads the same
+# bytes. timing-windows prints this file's checksum, so two runs that show the
+# same number provably used the same terms.
+#
+# ── When to edit this file ─────────────────────────────────────────────────
+# * You re-measured something on hardware. Put the NEW number here and say how
+#   you got it. Do not "adjust" a measured term to make an assertion pass: a
+#   changed system should force a RE-MEASUREMENT, not a recomputation.
+# * You reflashed the controller with modified firmware. Update the FW_ block
+#   AND bump FW_REV, or every guard that depends on the revision is defeated —
+#   see the warning in that section.
+#
+# Format: KEY=VALUE, one per line, no quoting, no expansion. Parsed by grep,
+# never sourced: this file ships to the node, and a report that executes its
+# own input is a report you cannot trust on a machine you are debugging.
+
+# ── MEASURED ───────────────────────────────────────────────────────────────
+# These two describe YOUR IMAGE, not the Witty Pi, and the values below are
+# from a reference setup: a Pi Zero W with a Witty Pi 4, an uncompressed
+# image. They are the right order of magnitude for a small Pi and they are not
+# a fact about your build. Re-measure them on the image you actually ship
+# before trusting the margins computed from them.
+
+# Power-on -> the point your image considers "booted".
+# Capture the console from BEFORE a scheduled wake so its first byte is the
+# bootloader banner, then anchor to /proc/stat btime. The reference breakdown:
+# 2.5 s firmware+bootloader, 7.5 s bootloader->kernel, 95.9 s kernel->userspace
+# gate. Measured 105.9, carried as 106.
+T_BOOT=106
+
+# Power-on -> the point your image marks this boot healthy.
+#
+# Only meaningful if your image has such a step — an A/B scheme returning a
+# boot attempt, a health-check unit, a watchdog handing over. wittypi-schedule
+# uses it as a floor so a duty cycle can never shut the node down before that
+# step has had time to run. If nothing in your image marks a boot good, this is
+# simply a conservative lower bound on the awake window.
+#
+# This is NOT T_BOOT plus the health soak. A soak that runs until a fixed
+# uptime SUBSUMES the boot rather than following it; adding the two gives ~400
+# here and is wrong by 90 seconds. Measure from power-on, not from boot.
+T_MARKGOOD=312
+
+# Halt request -> the kernel's "reboot: Power down", from a console capture of
+# a real `systemctl poweroff`. In the reference capture: 39.279 s (kernel's
+# "reboot: Power down") minus 31.257 s (first unit-stop message) = 8.022 s,
+# carried as 8.
+#
+# That run includes a FULL wake-guard arm, not its fast recheck. With alarm1
+# cleared beforehand, wake-guard.service's ExecStop takes the slow "nothing
+# armed yet" path — 4.004 s in the same capture, close to its TimeoutStopSec=5
+# ceiling. On the controller-initiated path the daemon's own wake-guard call
+# usually arms first, so the unit's ExecStop hits the fast already-armed
+# recheck (~0.7 s). But a Linux-initiated shutdown — a human typing `poweroff`,
+# or anything reaching wake-guard.service with nothing pre-armed — pays the
+# slow path and nothing else reserves budget for it. That is a real code path,
+# not a contrived worst case, so it is what this constant carries.
+#
+# Shutdown mechanics alone, subtracting that arm: 8.022 - 4.018 = ~4 s. Most of
+# the cost is the arming, not the rest of the shutdown.
+#
+# One measurement of a CLEAN shutdown. A node with more dirty pages, a unit
+# slow to stop, or a tired card takes longer, and the power-cut budget does not
+# stretch. Treat the slack over this number as the real safety margin, not the
+# number itself.
+T_SHUTDOWN=8
+
+# ── FIRMWARE — Witty Pi 4, ATtiny841 ───────────────────────────────────────
+# Read from WittyPi4.ino. Every counter here is a 1 Hz watchdog tick
+# (`WDTCSR |= 6; // trigger every second`, :309), so a "count of 120" is 120
+# seconds of wall clock.
+#
+# These are only true for one firmware build. If you recompile and flash the
+# controller, these numbers may no longer describe the hardware — and the node
+# has no way to know that, because the only thing it can read is the revision
+# register. So:
+#
+#   1. change a constant in the firmware  ->  change it HERE, and
+#   2. BUMP I2C_FW_REVISION in the firmware AND FW_REV below.
+#
+# If you skip step 2 the revision check passes against modified firmware and
+# every guard downstream of it is silently reasoning about the wrong hardware.
+# A stock rev-7 controller and your recompiled one are indistinguishable over
+# I2C unless you make them distinguishable.
+
+# What `i2cReg[I2C_FW_REVISION]` is set to (:270). Compared against register 12
+# on the board; a mismatch is a hazard, not a footnote.
+FW_REV=7
+
+# The alarm coincidence window (:878, :890).
+#
+# Not a timeout. The controller reduces both the RTC and the alarm to
+# date*86400 + h*3600 + m*60 + s and fires only while 0 <= now - alarm < this,
+# tested at 1 Hz. A missed alarm does not fire LATE; it does not fire at all,
+# until guaranteed wake. Everything about UTC-everywhere follows from the fact
+# that a DST conversion is a 3600 s step against a 2 s tolerance.
+FW_ALARM_WINDOW=2
+
+# Temperature actions are suppressed for this long after power-on
+# (`skipTempShutdownCount < 120`, :927; gate at :982; reset in powerOn(), :448).
+#
+# The reason register is still written during the inhibit. :935 sets
+# I2C_ACTION_REASON = REASON_OVER_TEMPERATURE and only THEN calls
+# turnOffIfPowerOn(), which is the part the counter gates. So register 11 can
+# read 6 on a node that did not shut down for temperature — do not treat a
+# reason of 6/7 as proof that the last power-off was thermal.
+FW_THERMAL_INHIBIT=120
+
+# Retry interval when alarm1 fires while the rail is already up (:692).
+FW_ALARM1_RETRY=4
+
+# Factory default for register 18, the housekeeping pulse while asleep (:274).
+# Our policy does not set this register, so the factory value is what runs.
+FW_PULSE_INTERVAL=4

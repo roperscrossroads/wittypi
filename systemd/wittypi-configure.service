@@ -1,0 +1,74 @@
+[Unit]
+Description=Apply the Witty Pi 4 register policy
+
+# ── Why this is a unit, and not a thing someone types once ─────────────────
+# The controller's registers live in the ATtiny's EEPROM, so they survive a
+# card reflash and every power cut. That sounds like it makes a boot-time
+# unit pointless — the opposite is true. It means the board's power policy
+# lives somewhere nothing in a typical build system builds, versions, or
+# reviews.
+#
+# A replacement Witty Pi arrives with DEFAULT_ON=0 and GUARANTEED_WAKE=0,
+# factory defaults. Fitting one to an unattended deployment without reapplying
+# policy would produce a board that doesn't come back after a power
+# interruption and has no guaranteed-wake backstop — both silent, both only
+# discovered the next time they were needed.
+#
+# So the image asserts the policy on every boot, and EEPROM is treated as a
+# cache of it rather than the source of truth.
+#
+# This does not wear the EEPROM: `updateRegister()` uses Arduino's
+# `EEPROM.update()`, which reads first and writes only on a difference. A
+# boot that changes nothing performs no write at all, which is what makes
+# running this on every boot of a duty cycle safe.
+After=data.mount
+Before=wittypi.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Site values — the power topology above all — are properties of an
+# installation, not of an image. Persistent storage survives updates and is
+# per-board, so a site sets them once there and every subsequent image
+# honours them:
+#
+#     # /data/wittypi.env
+#     WITTYPI_TOPOLOGY=usb5v          # or vin2s / vin3s
+#
+# and, on a vin* topology only, optional overrides of the per-topology
+# defaults:
+#
+#     WITTYPI_LOW_VOLTAGE=9.6
+#     WITTYPI_RECOVERY_VOLTAGE=10.2
+#
+# WITTYPI_TOPOLOGY is what decides whether low-voltage protection exists at
+# all: on a 5V USB-C feed the controller reads POWER_MODE 0 and the whole
+# path is inert. The tool refuses an unrecognised value rather than
+# defaulting one, so a typo here fails the unit instead of quietly deploying
+# an unprotected battery. See WITTYPI.md, "Registers to set — and the two
+# power topologies".
+#
+# The leading '-' means an absent file is not an error: a bench board with no
+# battery legitimately has none, and the tool applies only the
+# topology-independent rows when it has no topology to work from.
+EnvironmentFile=-/data/wittypi.env
+# flock: this writes a whole register table, one register at a time, and any
+# other reader or writer of the same registers landing mid-table would see
+# (or race) a half-applied policy. /run is tmpfs — nothing to clean up across
+# a reboot, and a held lock can't outlive a crashed holder, since the kernel
+# drops it when the fd closes. 10s is generous here (this competes with
+# nothing else at boot, and is not on the shutdown clock).
+ExecStart=/usr/bin/flock -w 10 /run/wittypi.lock /usr/bin/wittypi configure
+
+# Exit 1 is how the tool reports "no controller on the bus", which is a
+# normal bench configuration and must not fail the boot.
+#
+# Exit 2 is a contradictory site configuration, or a register that would not
+# take, and is deliberately NOT whitelisted — those must show in `systemctl
+# status` rather than being swallowed, since the one case this unit most
+# needs to surface is exactly the one a silent success would hide.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,326 @@
+#!/bin/sh
+# wittypi-schedule — the on-node duty-cycle scheduler.
+#
+# Without it an alarm fires exactly once, nothing renews the schedule, and a
+# human hand-writes registers from a workstation for every sleep/wake cycle.
+#
+# Runs at boot (wittypi-schedule.service), and on demand from the
+# supervisor's repair path, and when /data/wittypi-schedule.env exists it
+# unconditionally recomputes and re-arms BOTH alarms from the controller's
+# own RTC — anchored on ABSOLUTE CYCLE PHASE, so the result depends only on
+# the clock and never on when the run happened:
+#
+#   CYCLE = ON_SEC + OFF_SEC
+#   alarm2 (shutdown, regs 32-35) = <start of this window> + ON_SEC
+#   alarm1 (wake,     regs 27-30) = that + OFF_SEC             — written FIRST
+#
+# The phase anchor is what makes this re-runnable, and re-runnable is what
+# lets anything repair a stale schedule. See "The appointments" below.
+#
+# Alarm1 first, always: a crash at any later point still leaves a node that
+# wakes (WITTYPI.md's renewal ordering). The failure directions are chosen the
+# same way — if alarm1 cannot be armed, alarm2 is never attempted (a node that
+# stays up is recoverable; a node that schedules its own shutdown with nothing
+# to bring it back needs a site visit); if alarm2 fails after alarm1 landed,
+# the node wakes on schedule and merely fails to self-stop.
+#
+# Overwriting unconditionally is the design, not a hazard. A fired alarm
+# stays latched in its registers and reads as "armed" to every tool
+# (wake-guard's conservatism exists because it has no idea what the intended
+# schedule is). This script IS reading the source of truth, so overwriting is
+# applying policy — the same relationship `wittypi configure` has with the
+# EEPROM. wake-guard remains the backstop for every path that does not come
+# through here.
+#
+# Anchored on the controller's RTC, never on date -u +%s. The ATtiny
+# compares the alarm registers against ITS OWN clock once a second, inside a
+# 2-second match window. Linux's clock is whatever NTP has or has not done
+# yet; the RTC is the only anchor that matches what the firmware actually
+# does. A flat RTC (year 00) or an unconfirmable read is a REFUSAL, not a
+# fallback — appointments computed from a wrong clock are armed misses.
+#
+# The config file is sourced by this script, not by EnvironmentFile=.
+# /data/wittypi.env's example file documents the trap: EnvironmentFile is a
+# systemd directive, so a unit-fed config silently vanishes when a human runs
+# the tool at a prompt. Sourcing in-script makes `systemctl restart
+# wittypi-schedule.service` and a typed `wittypi-schedule` behave identically.
+# Absent file = hand-scheduled mode = clean no-op, so this is opt-in per node
+# and hand scheduling stays the default.
+#
+#   /data/wittypi-schedule.env:
+#     WITTYPI_SCHEDULE_ON_SEC=<sec>     # awake window. MUST exceed
+#                                       # T_MARKGOOD + 60 (timing-terms) —
+#                                       # shorter cycles condemn healthy slots
+#     WITTYPI_SCHEDULE_OFF_SEC=<sec>    # asleep window. ON+OFF must stay an
+#                                       # hour inside guaranteed wake (reg 49)
+#
+# No cycle values are written here, deliberately. The duty cycle is policy and
+# belongs to the deployment, so it has one home — WITTYPI.md, "The window, and
+# where to put it" — and a number pasted into this header would be the copy
+# nobody updates. Both BOUNDS above are enforced in code below, which is where
+# a bound belongs.
+#
+# Month-end note: date(1) does the calendar math for the day-of-month fields,
+# and the firmware's month-less pseudo-timestamp still matches at the real
+# moment because "now" wraps with it; a <=26 h cycle moves the day by at most
+# 2. Month-end rollover is unproven on hardware (see WITTYPI-ALARM1.md) —
+# guaranteed wake bounds a miss.
+#
+# No lock taken in-script: the unit wraps ExecStart in flock -w 10 on
+# /run/wittypi.lock, the same boot-time class as wittypi-clock/-configure.
+# wp_arm_alarm's TERM trap therefore runs still holding the lock, and
+# wake-guard's ensure (1 s wait, gives up rather than blocks) can never race
+# a half-written appointment.
+#
+# Overridable paths mirror the other ops tools' test seams; the shipped unit
+# runs the defaults.
+set -u
+
+WP_SCHED_LIB="${WITTYPI_SCHEDULE_LIB:-/usr/libexec/site/wittypi-lib.sh}"
+WP_SCHED_ENV="${WITTYPI_SCHEDULE_ENV:-/data/wittypi-schedule.env}"
+WP_SCHED_TERMS="${WITTYPI_SCHEDULE_TERMS:-/usr/lib/site/timing-terms}"
+WP_SCHED_NOTIFY="${WITTYPI_SCHEDULE_NOTIFY:-/usr/bin/notify}"
+# Read to place the stop clear of THIS boot's mark-good, not merely clear of
+# "now" — see the mark-good floor below. Same seam name the daemon and the
+# health gate already use.
+WP_SCHED_UPTIME="${PROC_UPTIME:-/proc/uptime}"
+
+# shellcheck source=/dev/null
+. "$WP_SCHED_LIB" || exit 1
+
+refuse() {
+    wp_log_err "schedule REFUSING: $1 — nothing written"
+    exit 2
+}
+
+# The one notify wording rule: a scheduler that half-worked is exactly what a
+# human needs to hear about while the network is still up.
+sched_page() {
+    "$WP_SCHED_NOTIFY" -t "wittypi scheduler" -p high -g warning "$1" \
+        >/dev/null 2>&1 || true
+}
+
+# ── The config is read first, and the order matters ────────────────────────
+# These two gates the other way round costs a node its duty cycle. With the
+# controller probed first, a probe that comes back empty exits 0 — "no
+# controller on the bus" — before anything has looked at whether this node was
+# even opted in. systemd records success, nothing pages, and the one line
+# explaining it is wp_log at info priority, which a volatile journal discards
+# at the next boot.
+#
+# This way round, the config decides what an absent controller MEANS, which is
+# the
+# whole point: the same silence is benign in one configuration and a stopped
+# duty cycle in the other.
+#
+#   no env  -> hand-scheduled/bench. A missing controller is EXPECTED and this
+#              stays a clean, quiet exit 0. A bench Pi must never page.
+#   env     -> this node has been opted in to a duty cycle. A controller that
+#              does not answer now means NOTHING WILL ARM AND NOTHING WILL
+#              SHUT THIS NODE DOWN, which is the one failure direction this
+#              design has no exit from — every layer here pushes the node UP
+#              (alarm1's deferred re-fire, wake-guard, guaranteed wake) and
+#              none pushes it down.
+if [ ! -r "$WP_SCHED_ENV" ]; then
+    wp_log "schedule: $WP_SCHED_ENV absent — hand-scheduled mode, nothing to renew"
+    exit 0
+fi
+
+# ── OPTED IN: the controller must answer, and one miss is not an answer ─────
+# Retried, because the failure this guards against is a race and not a dead
+# board. A node coming up from cold can have this unit probe ~15 s into boot
+# and get nothing, while the supervisor reads the same controller without
+# trouble ten minutes later. A cold ATtiny that is not ready yet is
+# indistinguishable from an absent one on a single read, so take more than
+# one. wp_get_stable already retries at the READ level; what is needed here is
+# a caller willing to wait for the device to exist.
+#
+# Costs nothing on a healthy boot: the first probe succeeds and the loop is
+# never entered. The bound is well inside the unit's TimeoutStartSec=30, and
+# none of this is on the shutdown clock.
+WP_SCHED_PROBE_TRIES="${WITTYPI_SCHEDULE_PROBE_TRIES:-10}"
+wp_sched_try=1
+while ! wp_present; do
+    if [ "$wp_sched_try" -ge "$WP_SCHED_PROBE_TRIES" ]; then
+        # Exit non-zero, and that is the diagnostic as much as the alarm.
+        # This unit has no SuccessExitStatus= whitelist, so a non-zero exit
+        # makes systemd emit "Failed to start ..." at ERR priority — which is
+        # what a persist-only-errors journal keeps. A quiet exit 0 leaves no
+        # trace that survives the reboot; this one does, in the only log the
+        # node still has after a power cycle.
+        wp_log_err "schedule: OPTED IN via $WP_SCHED_ENV but the controller did not answer in $WP_SCHED_PROBE_TRIES probes — NOTHING IS ARMED and nothing will stop this node. Not a bench no-op: a schedule is configured and there is no controller to run it."
+        sched_page "controller did not answer — the duty cycle is NOT armed and this node will not stop itself"
+        exit 2
+    fi
+    wp_sched_try=$(( wp_sched_try + 1 ))
+    sleep 1
+done
+[ "$wp_sched_try" -eq 1 ] || \
+    wp_log "schedule: the controller answered on probe $wp_sched_try — it was not ready when this unit started"
+
+# shellcheck source=/dev/null
+. "$WP_SCHED_ENV"
+
+wp_sched_on="${WITTYPI_SCHEDULE_ON_SEC:-}"
+wp_sched_off="${WITTYPI_SCHEDULE_OFF_SEC:-}"
+case "$wp_sched_on" in ''|*[!0-9]*)
+    refuse "WITTYPI_SCHEDULE_ON_SEC is '${wp_sched_on:-unset}', not a plain integer" ;;
+esac
+case "$wp_sched_off" in ''|*[!0-9]*)
+    refuse "WITTYPI_SCHEDULE_OFF_SEC is '${wp_sched_off:-unset}', not a plain integer" ;;
+esac
+
+# ── Bound 1: the awake window must clear mark-good ─────────────────────────
+# T_MARKGOOD is a MEASURED term (312 s: power-on to the boot counter reset).
+# An ON window shorter than that is a node whose every scheduled shutdown
+# lands before the slot is marked good — three cycles condemn a slot and six
+# condemn both, for a fault in neither. Read from the shipped timing-terms;
+# a measured term that cannot be read stops the run rather than being
+# defaulted. The +60 margin matches timing-windows' check 7, which is what
+# ties the two together.
+wp_sched_mg=$(sed -n 's/^T_MARKGOOD=\([0-9][0-9]*\)$/\1/p' "$WP_SCHED_TERMS" 2>/dev/null | sed -n 1p)
+[ -n "$wp_sched_mg" ] || refuse "cannot read T_MARKGOOD from $WP_SCHED_TERMS — refusing to bound the ON window by guesswork"
+wp_sched_floor=$(( wp_sched_mg + 60 ))
+[ "$wp_sched_on" -ge "$wp_sched_floor" ] || \
+    refuse "ON_SEC $wp_sched_on is under the mark-good floor ${wp_sched_floor}s (T_MARKGOOD $wp_sched_mg + 60) — this cycle would condemn healthy slots"
+
+# ── Bound 2: the whole cycle must stay inside guaranteed wake ──────────────
+# Register 49: bits 0-6 the value, bit 7 the unit (0 = hours, 1 = days). The
+# LIVE register, not the site file — the EEPROM is what the MCU acts on. A
+# cycle that outruns the backstop turns a missed alarm1 from "late by the
+# remainder of 26 h" into "dark until someone visits it"; the hour of margin
+# keeps layer 3 held in reserve rather than racing alarm1. `timing-windows`
+# checks the same relationship against the configured cycle.
+wp_sched_gw=$(wp_get_stable "$WP_REG_GUARANTEED_WAKE") || \
+    refuse "guaranteed-wake register 49 unreadable — will not schedule without knowing the backstop"
+[ "$wp_sched_gw" != "0" ] || \
+    refuse "guaranteed wake is DISABLED (register 49 = 0) — enable the last-resort backstop before automating the schedule"
+if [ $(( wp_sched_gw & 0x80 )) -ne 0 ]; then
+    wp_sched_gw_sec=$(( (wp_sched_gw & 0x7F) * 86400 ))
+else
+    wp_sched_gw_sec=$(( wp_sched_gw * 3600 ))
+fi
+wp_sched_cycle=$(( wp_sched_on + wp_sched_off ))
+[ "$wp_sched_cycle" -le $(( wp_sched_gw_sec - 3600 )) ] || \
+    refuse "cycle ${wp_sched_cycle}s does not fit an hour inside guaranteed wake (${wp_sched_gw_sec}s) — the backstop must outlast the schedule"
+
+# ── The anchor ─────────────────────────────────────────────────────────────
+wp_sched_now=$(wp_rtc_read_confirmed)
+wp_sched_rc=$?
+if [ "$wp_sched_rc" != 0 ]; then
+    if [ -n "$wp_sched_now" ]; then
+        refuse "the RTC has lost power (reads $wp_sched_now, year 00) — check the coin cell; appointments computed from an epoch clock are armed misses"
+    fi
+    refuse "the RTC could not be read consistently — no two consecutive reads agreed"
+fi
+wp_sched_now_s=$(date -u -d "$wp_sched_now" +%s 2>/dev/null)
+[ -n "$wp_sched_now_s" ] || refuse "could not parse the RTC reading '$wp_sched_now' into an epoch"
+
+# ── The appointments: ANCHORED ON ABSOLUTE PHASE, NOT ON "now" ─────────────
+# `now + ON_SEC` / `now + CYCLE` is the obvious formulation, and it is why a
+# scheduler written that way can only ever be a boot oneshot. Appointments
+# measured from the instant of the run mean every run MOVES the schedule: run
+# it twice and the shutdown is pushed out twice, so nothing can re-run it as a
+# repair without silently redefining the duty cycle. The one event that
+# re-arms alarm2 is then a boot — and the only thing that causes a boot is a
+# successful shutdown. That is a closed loop: any failure leaving the node
+# awake past its appointment is PERMANENT, because the repair is downstream of
+# the thing that failed.
+#
+# Anchoring on the wall clock breaks the loop. Cycle boundaries are absolute
+# — multiples of CYCLE since the epoch — so the appointments become a PURE
+# FUNCTION of (clock, ON, OFF). Running this at boot, from a timer, or from
+# the supervisor's repair path computes the identical pair, and re-running it
+# mid-window is a no-op that rewrites the same two values. Idempotence is
+# what makes every other robustness measure in this layer possible.
+#
+#     stop = <start of the current window> + ON      (≡ ON  mod CYCLE)
+#     wake = stop + OFF                              (≡ 0   mod CYCLE)
+#
+# Two properties fall straight out and are asserted below: wake is ALWAYS
+# after stop, and the sleep is ALWAYS exactly OFF seconds — so bound 2's
+# guaranteed-wake margin holds no matter which branch was taken.
+#
+# Side benefit worth having on a node behind a duty-cycled backhaul: the
+# awake window lands at the same wall-clock offsets every cycle, so the far
+# end can PREDICT when the node is reachable instead of watching for it.
+# Boot latency no longer walks the schedule forward a little on every cycle.
+wp_sched_stop=$(( wp_sched_now_s - (wp_sched_now_s % wp_sched_cycle) + wp_sched_on ))
+
+# Never stop before this boot's mark-good can land. Bound 1 above proves a
+# WHOLE window clears T_MARKGOOD; it cannot prove the REMAINDER of one does.
+# Two ways to land mid-window: an off-phase boot (a plug-in, the button,
+# guaranteed wake — the rail came up at a moment the schedule never chose), or
+# a boot so slow that the window is nearly spent by the time this runs.
+# Arming the current window's stop in either case shuts the node down before
+# whatever marks this boot healthy has had time to run. Where that health mark
+# gates an A/B rollback, a scheduler that keeps cutting the window short
+# manufactures the very fault the rollback exists to escape — so the floor
+# below is not optional, even though nothing in this package enforces it.
+#
+# The health mark lands T_MARKGOOD after POWER-ON, not after this script, so
+# the earliest safe stop is measured from boot: now - uptime + T_MARKGOOD + 60.
+# Same +60 margin as bound 1, and timing-windows check 7 ties the two
+# together. An unreadable uptime falls back to treating NOW as the boot
+# instant, which is strictly conservative — it can only push the stop later.
+#
+# Two floors, and the first one is not optional. An appointment in the
+# past cannot fire at all — the match window is 2 s wide and the firmware
+# does not fire late — so the stop must clear NOW by enough lead for the
+# write to land and the MCU to see it before the moment arrives. The
+# mark-good floor alone does NOT imply this: on a node that has been up for
+# hours, `boot + T_MARKGOOD + 60` is itself hours in the past, so it permits
+# a stop that has already elapsed. Taking the later of the two is what makes
+# the result unfireable-proof at both ends.
+#
+# 60 s of lead costs at most 60 s of a window in the skip case, and buys
+# immunity to a slow I2C write landing on the wrong side of the appointment.
+WP_SCHED_LEAD="${WITTYPI_SCHEDULE_LEAD:-60}"
+wp_sched_up=$(cut -d' ' -f1 "$WP_SCHED_UPTIME" 2>/dev/null | cut -d. -f1)
+case "$wp_sched_up" in ''|*[!0-9]*) wp_sched_up=0 ;; esac
+wp_sched_earliest=$(( wp_sched_now_s + WP_SCHED_LEAD ))
+wp_sched_mgfloor=$(( wp_sched_now_s - wp_sched_up + wp_sched_mg + 60 ))
+[ "$wp_sched_mgfloor" -gt "$wp_sched_earliest" ] && wp_sched_earliest=$wp_sched_mgfloor
+
+# Advance whole cycles until the stop clears that floor. Computed, not
+# looped: this is arithmetic on a value an unreadable clock could in
+# principle make absurd, and a `while` here would be an unbounded loop on
+# the one path that must never hang.
+if [ "$wp_sched_stop" -lt "$wp_sched_earliest" ]; then
+    wp_sched_skip=$(( (wp_sched_earliest - wp_sched_stop + wp_sched_cycle - 1) / wp_sched_cycle ))
+    wp_sched_stop=$(( wp_sched_stop + wp_sched_skip * wp_sched_cycle ))
+    wp_log "schedule: this window's stop is already spent or inside the mark-good floor — skipping ${wp_sched_skip} cycle(s) so the appointment can still fire and the slot can be marked good first"
+fi
+
+wp_sched_wake=$(( wp_sched_stop + wp_sched_off ))
+
+# The pair is checked as a set, not just field by field. wp_arm_alarm
+# reads back each alarm it writes, so a register that did not take is
+# already caught — but nothing until now checked the RELATIONSHIP between
+# the two, and a pair that lands the wrong way round is a node that wakes
+# and immediately stops, or one that never sleeps. These are properties of
+# the arithmetic above and cannot fail unless that arithmetic is edited;
+# that is exactly why they are asserted rather than trusted.
+[ "$wp_sched_stop" -gt "$wp_sched_now_s" ] || \
+    refuse "computed a shutdown at or before now (stop $wp_sched_stop, now $wp_sched_now_s) — refusing to arm an appointment that cannot fire"
+[ "$wp_sched_wake" -gt "$wp_sched_stop" ] || \
+    refuse "computed a wake at or before the shutdown (wake $wp_sched_wake, stop $wp_sched_stop) — refusing to arm a pair that would leave the node with no way back"
+
+# ── alarm1 FIRST — always ──────────────────────────────────────────────────
+if ! wp_arm_alarm "$WP_REG_ALARM1_SEC" "$wp_sched_wake"; then
+    wp_log_err "schedule: could NOT arm the wake (alarm1) — alarm2 deliberately untouched; the node stays up rather than scheduling a shutdown with no way back"
+    sched_page "scheduler could not arm the wake alarm — node left up, schedule NOT applied"
+    exit 1
+fi
+
+if ! wp_arm_alarm "$WP_REG_ALARM2_SEC" "$wp_sched_stop"; then
+    wp_log_err "schedule: wake armed but the shutdown (alarm2) could not be — the node will wake on schedule and simply not self-stop this cycle"
+    sched_page "scheduler armed the wake but not the shutdown — node will not self-stop this cycle"
+    exit 1
+fi
+
+# Absolute instants, not "+Ns" offsets: the appointments are phase-anchored
+# now, so an offset from an unstated origin is the one rendering that cannot
+# be checked against the registers a human is about to read.
+wp_log "schedule: cycle ON ${wp_sched_on}s / OFF ${wp_sched_off}s, RTC $wp_sched_now — shutdown $(date -u -d "@$wp_sched_stop" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) UTC (in $(( wp_sched_stop - wp_sched_now_s ))s), wake $(date -u -d "@$wp_sched_wake" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) UTC"
+exit 0

@@ -1,0 +1,197 @@
+#!/bin/sh
+# wittypi-audit — everything a human wants to know about this node's power
+# controller, on one screen, read live. The interactive counterpart to
+# wittypi-watch: the supervisor pages on three hazards every 15 minutes;
+# this answers "and what is the whole picture right now?" when someone is
+# already holding a terminal.
+#
+# READ-ONLY, structurally (the same assertions that pin wittypi-watch pin
+# this): no writes, no lock, no traps. It reads through the same sources
+# the machinery uses — `wittypi` for the registers (stable-read dispatch
+# included), `wake-guard check` for alarm1's tri-state (no reimplementation
+# of armed()'s day-validation), wp_check_guaranteed_wake() shared with the
+# supervisor so the two can never render different verdicts from the same
+# registers.
+#
+# What it deliberately does NOT cover: the timing-budget axis. That is
+# timing-windows' whole job — a different question, and duplicating it here
+# would give the numbers a second home to drift in.
+#
+# The scheduler section reports the mode honestly: config absent = the
+# hand-scheduled world, where wake-guard's shutdown rescue is the only
+# automatic arming; config present = the intended-vs-armed delta, judged on
+# the same alarm2 decode as the block above and the same verdicts the
+# watch's check 4 pages on (one reasoning, two surfaces).
+
+WP_AUDIT_LIB="${WITTYPI_AUDIT_LIB:-/usr/libexec/site/wittypi-lib.sh}"
+WP_AUDIT_WITTYPI="${WITTYPI_AUDIT_WITTYPI:-/usr/bin/wittypi}"
+WP_AUDIT_WAKE_GUARD="${WITTYPI_AUDIT_WAKE_GUARD:-/usr/libexec/site/wake-guard}"
+WP_AUDIT_ENV="${WITTYPI_AUDIT_ENV:-/data/wittypi.env}"
+WP_AUDIT_SCHEDULE="${WITTYPI_AUDIT_SCHEDULE:-/data/wittypi-schedule.env}"
+WP_AUDIT_RECORD="${WITTYPI_AUDIT_RECORD:-/data/wittypi-watch-hazards}"
+WP_AUDIT_SYNCED="${WITTYPI_AUDIT_SYNCED:-/run/systemd/timesync/synchronized}"
+
+# shellcheck source=/dev/null
+. "$WP_AUDIT_LIB" || exit 1
+
+if ! wp_present; then
+    echo "no Witty Pi controller on the bus — nothing to audit."
+    echo "(normal on a bench Pi without the HAT; wiring, if one is fitted)"
+    exit 1
+fi
+
+# The same effective intent the units see, in the same precedence:
+# environment (a bench override) > /data/wittypi.env > the board registry.
+# The site file is GREPPED, not sourced — EnvironmentFile= does not execute
+# its file and neither does this. Only the one variable the audit compares
+# is pulled; the full table comparison is `wittypi check`'s job.
+if [ -z "${WITTYPI_GUARANTEED_WAKE+x}" ] && [ -r "$WP_AUDIT_ENV" ]; then
+    wp_a_gw=$(sed -n 's/^WITTYPI_GUARANTEED_WAKE=//p' "$WP_AUDIT_ENV" | sed -n 1p)
+    [ -n "$wp_a_gw" ] && WITTYPI_GUARANTEED_WAKE=$wp_a_gw
+fi
+wp_load_board_env >/dev/null 2>&1 || true
+
+echo "── wittypi-audit — $(date -u '+%Y-%m-%d %H:%M:%S') UTC ──────────────────────"
+
+# ── board ──────────────────────────────────────────────────────────────────
+if wp_a_id=$(wp_board_id); then
+    if [ -n "${WP_BOARD_ENV_APPLIED:-}" ]; then
+        printf 'board       %s — calibration from %s\n' "$wp_a_id" "$WP_BOARD_ENV_APPLIED"
+    else
+        printf 'board       %s — NOT in the calibration registry (see boards/README in the repo)\n' "$wp_a_id"
+    fi
+else
+    printf 'board       identity unreadable (no serial, no wlan0 MAC)\n'
+fi
+
+# ── controller ─────────────────────────────────────────────────────────────
+echo "controller"
+"$WP_AUDIT_WITTYPI" status 2>&1 | sed 's/^/    /'
+
+# ── clock ──────────────────────────────────────────────────────────────────
+if wp_a_rtc=$("$WP_AUDIT_WITTYPI" rtc 2>/dev/null); then
+    printf 'rtc         %s' "$wp_a_rtc"
+    if [ -e "$WP_AUDIT_SYNCED" ]; then
+        wp_a_rtc_s=$(date -u -d "$wp_a_rtc" +%s 2>/dev/null)
+        wp_a_now_s=$(date -u +%s)
+        if [ -n "$wp_a_rtc_s" ] && [ -n "$wp_a_now_s" ]; then
+            wp_a_d=$(( wp_a_now_s - wp_a_rtc_s ))
+            [ "$wp_a_d" -lt 0 ] && wp_a_d=$(( -wp_a_d ))
+            printf ' — %ss from the NTP-synced clock\n' "$wp_a_d"
+        else
+            printf ' — comparison against the system clock failed\n'
+        fi
+    else
+        printf ' — system clock NOT NTP-synced, no comparison\n'
+    fi
+else
+    echo 'rtc         !! UNREADABLE — run "wittypi rtc" for the specific complaint'
+fi
+
+# ── alarm1, the wake ───────────────────────────────────────────────────────
+# wake-guard's own tri-state and its own words: its check logs the decoded
+# schedule on state 0, and its day-validation is the one that already caught
+# a half-written alarm on hardware. stderr is where it speaks.
+wp_a_wg=$("$WP_AUDIT_WAKE_GUARD" check 2>&1 >/dev/null)
+case $? in
+    0) printf 'alarm1      ARMED — %s\n' "${wp_a_wg#wake-guard: }" ;;
+    1) printf 'alarm1      not armed — fine while up: wake-guard arms a rescue at shutdown,\n'
+       printf '            and a scheduled node re-arms from its own config\n' ;;
+    *) printf 'alarm1      !! UNREADABLE (%s)\n' "${wp_a_wg#wake-guard: }" ;;
+esac
+
+# ── alarm2, the shutdown ───────────────────────────────────────────────────
+# The registers only this tool surfaces to a human (they were invisible
+# outside raw i2cget until the alarm blocks got names). Plain BCD, day-last
+# validity — the same convention the firmware's own match uses.
+wp_a2_s=$("$WP_AUDIT_WITTYPI" get 32 2>/dev/null)
+wp_a2_m=$("$WP_AUDIT_WITTYPI" get 33 2>/dev/null)
+wp_a2_h=$("$WP_AUDIT_WITTYPI" get 34 2>/dev/null)
+wp_a2_d=$("$WP_AUDIT_WITTYPI" get 35 2>/dev/null)
+# wp_a2_state carries the verdict forward to the scheduler section's
+# intended-vs-armed delta — one decode, two surfaces, no second opinion.
+case "$wp_a2_s$wp_a2_m$wp_a2_h$wp_a2_d" in
+    *[!0-9]*|'')
+        echo 'alarm2      !! UNREADABLE'
+        wp_a2_state=unreadable
+        ;;
+    *)
+        wp_a2_dd=$(( (wp_a2_d / 16) * 10 + (wp_a2_d % 16) ))
+        if [ "$wp_a2_dd" -lt 1 ] || [ "$wp_a2_dd" -gt 31 ]; then
+            echo 'alarm2      no shutdown scheduled'
+            wp_a2_state=none
+        else
+            printf 'alarm2      SHUTDOWN scheduled: day %02d at %02d:%02d:%02d UTC\n' \
+                "$wp_a2_dd" \
+                "$(( (wp_a2_h / 16) * 10 + (wp_a2_h % 16) ))" \
+                "$(( (wp_a2_m / 16) * 10 + (wp_a2_m % 16) ))" \
+                "$(( (wp_a2_s / 16) * 10 + (wp_a2_s % 16) ))"
+            wp_a2_state=armed
+        fi
+        ;;
+esac
+
+# ── guaranteed wake — the shared verdict, never a second opinion ───────────
+wp_a_gwv=$(wp_check_guaranteed_wake "${WITTYPI_GUARANTEED_WAKE:-}")
+case $? in
+    0) if [ -n "${WITTYPI_GUARANTEED_WAKE:-}" ]; then
+           printf 'guaranteed  register 49 = %s — matches the site policy\n' "$wp_a_gwv"
+       else
+           printf 'guaranteed  register 49 = %s — enabled (no site policy stated to compare)\n' "$wp_a_gwv"
+       fi ;;
+    1) printf 'guaranteed  !! DRIFTED — register 49 reads %s, site policy says %s\n' \
+           "$wp_a_gwv" "$WITTYPI_GUARANTEED_WAKE" ;;
+    3) printf 'guaranteed  !! DISABLED — register 49 is 0: no last-resort wake\n' ;;
+    *) printf 'guaranteed  !! UNREADABLE\n' ;;
+esac
+
+# ── the scheduler ──────────────────────────────────────────────────────────
+if [ -r "$WP_AUDIT_SCHEDULE" ]; then
+    printf 'scheduler   %s present:\n' "$WP_AUDIT_SCHEDULE"
+    grep -v '^#' "$WP_AUDIT_SCHEDULE" | grep -v '^$' | sed 's/^/    /'
+    # The intended-vs-armed delta, on the alarm2 verdict decoded above (the
+    # watch's check 4 pages the same conditions; this is the same reasoning
+    # in the same words, read on demand). "Past" is judged on the firmware's
+    # own month-less pseudo-timestamp; beyond half a month the day-of-month
+    # has wrapped and the appointment is next month's, i.e. future.
+    case "$wp_a2_state" in
+        none)
+            printf '    !! configured but alarm2 holds NO shutdown appointment —\n'
+            printf '       the node will not stop itself; check wittypi-schedule.service\n'
+            ;;
+        armed)
+            if [ -n "${wp_a_rtc:-}" ]; then
+                wp_a_now_ts=$(( $(printf '%s' "$wp_a_rtc" | cut -c9-10 | sed 's/^0//') * 86400 \
+                              + $(printf '%s' "$wp_a_rtc" | cut -c12-13 | sed 's/^0//') * 3600 \
+                              + $(printf '%s' "$wp_a_rtc" | cut -c15-16 | sed 's/^0//') * 60 \
+                              + $(printf '%s' "$wp_a_rtc" | cut -c18-19 | sed 's/^0//') ))
+                wp_a2_ts=$(( wp_a2_dd * 86400 \
+                           + $(( (wp_a2_h / 16) * 10 + (wp_a2_h % 16) )) * 3600 \
+                           + $(( (wp_a2_m / 16) * 10 + (wp_a2_m % 16) )) * 60 \
+                           + $(( (wp_a2_s / 16) * 10 + (wp_a2_s % 16) )) ))
+                wp_a2_over=$(( wp_a_now_ts - wp_a2_ts ))
+                if [ "$wp_a2_over" -gt 5 ] && [ "$wp_a2_over" -le 1209600 ]; then
+                    printf '    !! alarm2 is %ss in the PAST — it can no longer fire and the\n' "$wp_a2_over"
+                    printf '       node will not stop itself; check wittypi-schedule.service\n'
+                else
+                    printf '    shutdown appointment consistent with a running schedule\n'
+                fi
+            fi
+            ;;
+    esac
+else
+    printf 'scheduler   %s absent — HAND-SCHEDULED mode: nothing renews alarms;\n' "$WP_AUDIT_SCHEDULE"
+    printf '            wake-guard'\''s shutdown rescue is the only automatic arming\n'
+fi
+
+# ── the supervisor's memory ────────────────────────────────────────────────
+if [ -s "$WP_AUDIT_RECORD" ]; then
+    printf 'hazards     !! %s recorded in %s — last 5:\n' \
+        "$(grep -c '' "$WP_AUDIT_RECORD")" "$WP_AUDIT_RECORD"
+    tail -n 5 "$WP_AUDIT_RECORD" | sed 's/^/    /'
+else
+    printf 'hazards     none recorded (%s)\n' "$WP_AUDIT_RECORD"
+fi
+
+echo "── timing budgets are a different question: run timing-windows"
+exit 0

@@ -1,0 +1,94 @@
+[Unit]
+Description=Renew the duty-cycle alarms from the on-node schedule
+Documentation=file:///usr/libexec/site/wittypi-schedule
+
+# Not only a boot unit, though it is still enabled as one. wittypi-watch
+# restarts this unit to repair a missing or past-dated alarm2, and again after
+# it has had the RTC corrected. That is safe only because the script anchors
+# its appointments on absolute cycle phase, so a re-run mid-window recomputes
+# the same two instants rather than pushing the schedule forward — see the
+# script's "The appointments" header and WITTYPI.md, "Renewal, repair, and why
+# the scheduler is a pure function of the clock". If that anchor is ever
+# changed to an offset from `now`, the watch's repair path must be removed in
+# the same commit.
+#
+# The watch uses restart, not start, and must. RemainAfterExit=yes below
+# leaves this unit `active` after its boot run, and `systemctl start` on an
+# already-active unit is a silent no-op — a repair that reports success and
+# does nothing.
+
+# The config lives on /data; an absent file is the supported hand-scheduled
+# mode, but a schedule must never be skipped because the mount raced.
+RequiresMountsFor=/data
+After=data.mount
+
+# The serialized boot chain is clock -> configure -> (this) on the one I2C
+# bus: the clock unit first (WITTYPI.md: order the clock unit before the
+# schedule unit — the vendor's own script spins forever on a 1970 clock),
+# configure second (its policy writes and stale-flag block must settle
+# before anything reads the alarm block). Deliberately NOT
+# Before=wittypi.service: SYS_UP must reach the MCU early, and the flock
+# plus the lib's glitch-tolerant reads make daemon concurrency safe — the
+# daemon never writes a register.
+After=wittypi-clock.service wittypi-configure.service
+
+# After=wake-guard.service is a STOP-order directive — the same derivation as
+# wittypi-watch.service, now for a writer. systemd stops units in the inverse
+# of start order, so on a shutdown that races a mid-write scheduler THIS unit
+# is stopped first: wp_arm_alarm's TERM trap clears day-then-seconds (an inert,
+# unambiguous state) and the flock dies with the process — and only THEN does
+# wake-guard.service's ExecStop run the arming that matters, against a free
+# lock. Before= would instead run ensure against the held lock, give it up
+# after 1 s, and cut the rail with nothing armed. The MCU-initiated path
+# self-heals the same way: the daemon's own direct `ensure` may contend and
+# give up, but the unit's ExecStop ensure runs later, post-trap, and arms.
+# tests/cases/wittypi-schedule.sh pins the direction with a negative
+# assertion so a well-meaning "fix" back to Before= fails the suite.
+After=wake-guard.service
+
+# Stopped early in a shutdown transition, same idiom as the other units.
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+# The verdict (armed appointments, a refusal, hand-scheduled mode) stays
+# visible in systemctl status all cycle.
+RemainAfterExit=yes
+
+# wp_rtc_read_confirmed can retry several bracketed multi-field reads on a
+# glitchy bus, and the script also probes for the controller up to 10 times at
+# 1 s intervals before declaring an opted-in node unschedulable. Worst case
+# that is flock's 10 s wait + 10 s of probing + the RTC retries + the arming,
+# which does not fit in 30 s — and being killed at the timeout is precisely the
+# mid-arm interruption the TERM trap exists to survive, rather than a state
+# worth entering on purpose.
+#
+# 60 s bounds all of it with room to spare. Nothing here is on the shutdown
+# clock, and the cost of the larger bound is paid only on a boot that is
+# already going wrong: a healthy run finishes in around 3 s.
+TimeoutStartSec=60
+
+# The stop path is the TERM trap only (clear two registers, ~0.5 s). NOT a
+# term in the five-term shutdown budget: only a shutdown racing the boot-time
+# run ever stops this mid-flight, and that transition is TXD-detected, not
+# on the register-21 countdown.
+TimeoutStopSec=5
+
+# The same boot-time lock class as wittypi-clock/-configure: 10 s is
+# generous and none of this is on the shutdown clock. The script itself
+# takes no lock — the trap must run under THIS flock so a half-written
+# alarm can never race wake-guard's 1 s wait.
+ExecStart=/usr/bin/flock -w 10 /run/wittypi.lock /usr/libexec/site/wittypi-schedule
+
+# No EnvironmentFile=, deliberately. The script sources
+# /data/wittypi-schedule.env itself, so a typed `wittypi-schedule` at a prompt
+# behaves identically to this unit — the trap wittypi.env.example documents
+# for the configure unit is not repeated here. A negative test asserts the
+# directive stays absent.
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

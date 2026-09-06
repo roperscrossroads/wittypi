@@ -1,0 +1,199 @@
+Subject: [PATCH] default-on: fail ON, and stop the delay overflowing
+
+Against Witty Pi 4 firmware V4.23 (d466cbc), WittyPi4.ino.
+
+This firmware is full. Stock is 8190 of 8192 bytes — 99%, two bytes spare.
+This patch uses both and lands at 8192 exactly, 100%. Nothing else will fit
+without removing vendor code, which is why it does only the three things that
+CANNOT be done anywhere else.
+
+WHY ONLY THREE THINGS
+---------------------
+wittypi-configure.service runs `wittypi configure` on every boot and writes the
+whole register policy, so any config register corrupted in EEPROM is
+overwritten with the right value at the next boot. Configuration is already
+self-healing in userspace.
+
+That leaves exactly two registers userspace cannot rescue, because they act
+inside setup() before Linux exists:
+
+  17  DEFAULT_ON        decides whether the rail comes up at all
+  47  DEFAULT_ON_DELAY  how long it waits, via an expression that overflows
+
+Everything else belongs in /data/wittypi.env, and is there. The flash budget
+and the correct division of labour happen to agree.
+
+1. INVERT REGISTER 17
+   Stock: `== 1`. One value of 256 powers the Pi on, 255 leave it waiting for a
+   button press. On an unattended, hard-to-reach install that polarity is
+   backwards, and the controller validates nothing: no CRC, no magic, no
+   version, no range check anywhere in the image, and the EEPROM load adopts
+   any byte that is not 255 verbatim.
+
+   Now `!= 0x5A`: one value waits, 255 power on. Costs 0 bytes — same
+   compare-and-branch.
+
+   0x5A is chosen for DISTANCE, not convention. Retention decay drifts toward
+   the erased 0xFF; an interrupted write of the 0x01 this register normally
+   holds can land on 0x00. 0x5A is 5 bits from 0x01 and 4 from 0xFF.
+
+   A wiped EEPROM now powers on by itself, because i2cReg zero-initialises
+   and 0 != 0x5A. No seed needed — which matters, since the flash that installs
+   this erases the EEPROM (hfuse 0xdd, EESAVE unprogrammed).
+
+   Diverges from the vendor on one value: their documented "0 = no" now
+   means ON. Use 90 to keep a board off.
+
+2. MASK THE DEFAULT-ON DELAY AT THE POINT OF USE
+   `delay(reg * 1000)` computes the product in a 16-bit int. Above 32 it wraps:
+   254 reaches delay() as 4,294,959,152 ms — 49.7 days of rail-off,
+   indistinguishable from dead hardware. A value like this has actually caused
+   a real outage this way.
+
+   `& 0x1F` bounds it to 31 (31000 fits int16) for 4 bytes. A compare-and-clamp
+   on load cost 12 and did not fit. Masking at the point of use also guards the
+   dangerous operation directly, with no branch to get wrong.
+
+   The stored register is not modified, so a corrupt value above 32 still
+   READS as itself while behaving as value & 31. Only reachable via corruption:
+   the policy writes 10 and userspace refuses anything over 32.
+
+   Not monotonic — 131 is worse than 254, and 229 is harmless. "Keep it
+   small" cannot be applied by eye, which is why this is a mask and not advice.
+
+3. SEED THE POWER-CUT DELAY AT 20.0 s
+   Stock seeds 70 (7.0 s). The shutdown it must cover is 6 s measured plus an
+   8 s mark-good grace = 14 s, so 7.0 s cuts the rail mid-write. Free: same
+   instruction, different constant.
+
+WHAT IS DELIBERATELY ABSENT
+---------------------------
+An EEPROM-persistence fix (stop persisting live measurements and the
+firmware revision, which otherwise get shadowed by stale EEPROM bytes) is
+not included — it doesn't fit in the two spare bytes this firmware has.
+Both motivations are survivable without it: wear only arms on a VIN
+topology this node is not on, and the revision shadow is moot because
+every flash erases the EEPROM anyway, so register 12 is re-seeded from
+firmware regardless.
+
+The site marker is dropped. Firmware is identified by reading flash back
+and comparing against the built hex, which verifies the whole image rather than
+one byte.
+
+The RTC calibration offset is NOT seeded here. It is per-board — 119 is this
+crystal — so a firmware seed would give another board a plausible WRONG
+calibration rather than an obviously absent one. It lives in
+/data/wittypi.env as WITTYPI_RTC_OFFSET, restored by configure at every boot.
+
+BUILD AND VERIFY
+----------------
+  arduino-cli compile --fqbn ATTinyCore:avr:attinyx41:chip=841,clock=8internal,\
+pinmapping=old,LTO=enable,wiremode=slave,neopixelport=porta,millis=disabled,\
+eesave=aenable,bod=2v7,bodact=enabled,bodpd=enabled <sketch>
+
+  stock   8190 bytes
+  patched 8192 bytes  (+2, exactly the ceiling)
+
+Do not verify by byte-comparing the hex. Adding two bytes shifts every
+relative jump after it, so ~1300 bytes differ from code motion alone. Verify at
+instruction level instead — each intended change is exactly +1 occurrence and
+the value it replaces is exactly -1:
+
+  cpi 0x5A   stock 0 -> patched 1     the sentinel
+  ldi 0xC8   stock 7 -> patched 8     the 20.0 s seed
+  andi 0x1F  stock 2 -> patched 3     the delay mask
+  ldi 0x46   stock 1 -> patched 0     the vendor 7.0 s seed, gone
+
+FLASHING
+--------
+FLASH ONLY. Never pass -U lfuse/hfuse/efuse. ISP is silicon rather than a
+bootloader, so a failed or partial flash write leaves a chip that is still
+fully programmable — retry it. Fuse writes are the only genuine brick, and the
+datasheet notes SPIEN is "not accessible in serial programming mode", so ISP
+cannot even disable itself. With the flash-only rule this cannot go
+permanently wrong.
+
+  avrdude -c usbasp-clone -p t841 -n                       # warm-up: the first
+                                                           # ISP entry after an
+                                                           # idle gap fails
+  avrdude -c usbasp-clone -p t841 -U flash:w:<hex>:i
+
+-c usbasp-clone, not usbasp: FASTUSBasp presents its own USB vendor/product
+strings and avrdude's usbasp entry matches on those rather than VID:PID.
+
+Expect: EEPROM wiped, the Pi power-cycled (setup() calls cutPower() first), and
+the node returning by itself because 0 != 0x5A.
+
+---
+--- a/Firmware/WittyPi4/WittyPi4.ino
++++ b/Firmware/WittyPi4/WittyPi4.ino
+@@ -65,7 +65,26 @@
+  * readable/writable registers
+  */
+ #define I2C_CONF_ADDRESS            16  // I2C slave address: defaul=0x08
+-#define I2C_CONF_DEFAULT_ON         17  // turn on RPi when power is connected: 1=yes, 0=no
++#define I2C_CONF_DEFAULT_ON         17  // turn on RPi: see DEFAULT_ON_BUTTON_VALUE
++
++// The ONLY value of register 17 that keeps the Pi off waiting for the button.
++// Every other value powers it on. Stock tested `== 1`, so ONE value of 256
++// powered on and 255 waited; on an unattended node that polarity is backwards.
++// The controller validates nothing -- no CRC, no magic, no range check -- and
++// the EEPROM load adopts any byte that is not 255 verbatim.
++//
++// 0x5A for DISTANCE: retention decay drifts toward the erased 0xFF, while an
++// interrupted write of the 0x01 this register normally holds can land on 0x00.
++// 0x5A is 5 bits from 0x01 and 4 from 0xFF, so neither mode reaches it.
++//
++// A wiped EEPROM now powers on by itself. i2cReg zero-initialises, and
++// 0 != 0x5A. That is why no seed is needed here -- which matters, because the
++// flash that installs this firmware erases the EEPROM (hfuse 0xdd, EESAVE
++// unprogrammed).
++//
++// Diverges from the vendor on ONE value: their documented "0 = no" now means
++// ON. Use 90 to keep a board off.
++#define DEFAULT_ON_BUTTON_VALUE     0x5A
+ #define I2C_CONF_PULSE_INTERVAL     18  // pulse interval (in seconds, for LED and dummy load): default=4 (4 sec)
+ #define I2C_CONF_LOW_VOLTAGE        19  // low voltage threshold (x10), 255=disabled
+ #define I2C_CONF_BLINK_LED          20  // how long the white LED should stay on (in ms), 0 if white LED should not blink.
+@@ -248,9 +267,22 @@
+   sei();
+ 
+   // power on or sleep
+-  bool defaultOn = (i2cReg[I2C_CONF_DEFAULT_ON] == 1);
++  bool defaultOn = (i2cReg[I2C_CONF_DEFAULT_ON] != DEFAULT_ON_BUTTON_VALUE);
+   if (defaultOn) {
+-    delay(i2cReg[I2C_CONF_DEFAULT_ON_DELAY] * 1000);  // delay if the value is configured
++    // Masked, because this multiply overflows. The product is computed in a
++    // 16-bit int: above 32 it wraps, and 254 reaches delay() as 4,294,959,152 ms
++    // -- 49.7 days of rail-off, indistinguishable from dead hardware. That is
++    // not hypothetical; it cost a 23-minute outage on 2026-08-15.
++    //
++    // & 0x1F bounds it to 31 (31 * 1000 = 31000, inside int16) for 4 bytes,
++    // where a compare-and-clamp on load cost 12 and did not fit. Masking at the
++    // point of USE also protects the dangerous operation directly, with no
++    // branch to get wrong.
++    //
++    // The stored register is NOT changed, so a corrupt value above 32 still
++    // READS as itself while the delay behaves as value & 31. Only reachable via
++    // corruption -- the policy writes 10 and userspace refuses anything over 32.
++    delay((i2cReg[I2C_CONF_DEFAULT_ON_DELAY] & 0x1F) * 1000);
+     updateRegister(I2C_ACTION_REASON, REASON_POWER_CONNECTED);
+     powerOn();  // power on directly
+   } else {
+@@ -274,7 +306,10 @@
+   i2cReg[I2C_CONF_PULSE_INTERVAL] = 4;
+   i2cReg[I2C_CONF_LOW_VOLTAGE] = 255;
+   i2cReg[I2C_CONF_BLINK_LED] = 100;
+-  i2cReg[I2C_CONF_POWER_CUT_DELAY] = 70;
++  // 25.0 s, not the stock 7.0 s, and not the 20.0 s this patch first carried.
++  // Everything after a shutdown request shares this budget and it is now four
++  // terms: wake-guard + notification + an 8 s mark-good grace + a 6 s Linux
++  // shutdown = 20 s. At a 20.0 s seed that does not fit, so a freshly flashed
++  // board would run a budget its own software would refuse.
++  // 250 is WP_MAX_POWER_CUT_DELAY x10 — register 21 is deci-seconds in a byte
++  // and 255 is the never-written sentinel, so this is the ceiling.
++  // Free, as before: same instruction, different constant.
++  i2cReg[I2C_CONF_POWER_CUT_DELAY] = 250;
+   i2cReg[I2C_CONF_RECOVERY_VOLTAGE] = 255;
+ 
+   i2cReg[I2C_CONF_ADJ_VIN] = 20;
