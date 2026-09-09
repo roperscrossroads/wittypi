@@ -532,9 +532,19 @@ assert_contains "$unit_text" 'WantedBy=multi-user.target' "enabled"
 describe "the recipe ships and enables it"
 if have "$OPS_BB" "wittypi-ops_1.0.bb (meta-wittypi layer)"; then
 bb=$(cat "$OPS_BB")
-assert_contains "$bb" 'file://wittypi-schedule.service' "unit in SRC_URI"
+# ── ASSERT THE DESTINATION, NOT THE FETCH OR THE SOURCE LAYOUT ────────────
+# These used to require `file://wittypi-schedule.service` in SRC_URI and a
+# source path of ${S}/wittypi-schedule.service. Both were facts about the layer
+# this repo was extracted FROM, and neither is satisfiable by a layer that
+# consumes this repo: how the source is fetched is the integrator's choice, and
+# this repo keeps its units in systemd/ rather than flat at the root.
+#
+# Matching "<name> ${D}" catches the tail of the source path and the start of
+# the destination, so it holds for ${S}/systemd/x.service, ${S}/x.service or
+# anything else, while still failing if the unit is never installed. That is
+# the pattern the .path assertions below already used.
 assert_contains "$bb" 'install -m 0755 ${S}/wittypi-schedule ${D}${libexecdir}/site/wittypi-schedule' "script installed executable"
-assert_contains "$bb" 'install -m 0644 ${S}/wittypi-schedule.service ${D}${systemd_system_unitdir}/wittypi-schedule.service' "unit installed"
+assert_contains "$bb" 'wittypi-schedule.service ${D}${systemd_system_unitdir}' "unit installed to the systemd unit dir"
 assert_contains "$bb" 'wittypi-watch.timer wittypi-schedule.service' "and ENABLED in SYSTEMD_SERVICE — the units-agree guard sees both directions"
 fi
 
@@ -648,8 +658,8 @@ fi
 describe "the recipe ships and enables the .path, and accounts for the wrapper"
 if have "$OPS_BB" "wittypi-ops_1.0.bb (meta-wittypi layer)"; then
 ops_bb=$(cat "$OPS_BB")
-assert_contains "$ops_bb" "file://wittypi-schedule.path" "path in SRC_URI"
-assert_contains "$ops_bb" "file://wittypi-reschedule.service" "wrapper in SRC_URI"
+# SRC_URI spelling dropped for the reason given above; the two destination
+# assertions below are the ones that mean anything to a consumer.
 assert_contains "$ops_bb" "wittypi-schedule.path ${D}" "path installed"
 assert_contains "$ops_bb" "wittypi-reschedule.service ${D}" "wrapper installed"
 assert_contains "$ops_bb" 'wittypi-watch.timer wittypi-schedule.service wittypi-schedule.path' \

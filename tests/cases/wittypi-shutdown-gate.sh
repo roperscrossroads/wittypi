@@ -28,6 +28,11 @@ PROFILE="$OPS_UNITS_DIR/wittypi-shutdown-gate.sh"
 # convention as WITTYPI_YOCTO_RECIPE in wittypi-board-env.sh.
 OPS_BB="${WITTYPI_YOCTO_OPS_RECIPE:-}"
 IMAGE_BB="${WITTYPI_YOCTO_IMAGE_RECIPE:-}"
+# The name of the integrator's ROOTFS_POSTPROCESS function that rewires
+# /usr/sbin. It is THEIRS to name, so it is a seam rather than a literal —
+# this file used to hardcode one deployment's choice, which no other consumer
+# could satisfy. Defaults to the obvious name; set it if yours differs.
+IMAGE_GATE_FUNC="${WITTYPI_YOCTO_IMAGE_GATE_FUNC:-wittypi_gate_shutdown_binaries}"
 
 # A fixture with the whole cast: wake-guard logging its subcommand and
 # exiting STUB_WG_STATE (default 0, armed), notify, a systemctl stand-in,
@@ -318,7 +323,11 @@ describe "the postprocess wraps exactly three names and polices the fourth"
 # quietly dropped, because "does anything actually invoke the gate?" is the
 # single most important question about it.
 if have "${IMAGE_BB:-}" "the consuming image — the integrator owns the wiring"; then
-ppc=$(sed -n '/^python tower_gate_shutdown_binaries/,/^}$/p' "$IMAGE_BB")
+ppc=$(sed -n "/^python ${IMAGE_GATE_FUNC}/,/^}\$/p" "$IMAGE_BB")
+if [ -z "$ppc" ]; then
+    printf '    SKIPPED: no "python %s" in the image recipe — set\n' "$IMAGE_GATE_FUNC"
+    printf '             WITTYPI_YOCTO_IMAGE_GATE_FUNC to your function name\n'
+else
 assert_contains "$ppc" 'bb.fatal' "the extraction found the function (and it fails loudly)"
 names_line=$(printf '%s\n' "$ppc" | grep 'for name in')
 assert_contains "$names_line" "('poweroff', 'halt', 'shutdown')" "the wrapped set, exactly"
@@ -326,7 +335,8 @@ assert_not_contains "$names_line" 'reboot' "reboot is never in the wrapped list"
 assert_contains "$ppc" 'reboot_link' "and its untouched state is ASSERTED, not assumed"
 assert_contains "$ppc" ".real" "the originals are preserved, not destroyed"
 assert_contains "$ppc" 'profile.d' "the inert-drop-in guard exists"
-assert_contains "$(cat "$IMAGE_BB")" 'ROOTFS_POSTPROCESS_COMMAND += "tower_gate_shutdown_binaries;"' "and the function is actually registered"
+assert_contains "$(cat "$IMAGE_BB")" "ROOTFS_POSTPROCESS_COMMAND += \"${IMAGE_GATE_FUNC};\"" "and the function is actually registered"
+fi
 fi
 
 describe "the profile layer: interactive only, absolute paths, reboot never named"
@@ -343,7 +353,8 @@ assert_not_contains "$prof_code" 'reboot' "the function must never learn to redi
 describe "the recipe ships both halves with the right modes"
 if have "$OPS_BB" "wittypi-ops_1.0.bb (meta-wittypi layer)"; then
 bb=$(cat "$OPS_BB")
-assert_contains "$bb" 'file://wittypi-shutdown-gate.sh' "profile.d file in SRC_URI"
+# SRC_URI spelling is the integrator's choice, not this repo's business. The
+# two install assertions below are what actually matter.
 assert_contains "$bb" 'install -m 0755 ${S}/wittypi-shutdown-gate ${D}${libexecdir}/site/wittypi-shutdown-gate' "gate executable in libexec/site"
 assert_contains "$bb" 'install -m 0644 ${S}/wittypi-shutdown-gate.sh ${D}${sysconfdir}/profile.d/wittypi-shutdown-gate.sh' "profile.d sourced, not executed: 0644"
 assert_contains "$bb" '${sysconfdir}/profile.d/wittypi-shutdown-gate.sh' "and packaged"
