@@ -57,6 +57,8 @@ The driver talks to the controller. The supervisor keeps a node that is
   on "now", so re-running it mid-window recomputes the *same* two instants —
   which is what makes it safe for anything else to re-run as a repair. Absent
   that file it is a clean no-op, so a hand-scheduled node is unaffected.
+  `wittypi-schedule.env.example` is a worked starting point: the two values,
+  four ready-made cycles, and the two bounds it will refuse to cross.
 - **`wittypi-watch`** — a read-only supervisor on a 15-minute timer. It checks
   the guaranteed-wake register, the alarm state, RTC plausibility against a
   synced system clock, and whether a configured node's shutdown appointment is

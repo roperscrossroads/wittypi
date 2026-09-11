@@ -700,8 +700,8 @@ rtc-write)
         printf 'The clock this board falls back on across a power cut is WRONG.\n' >&2
         exit 1
     fi
-    printf 'RTC set from system clock (UTC), all fields verified: %s\n' \
-        "$(wp_rtc_read)"
+    printf 'RTC set from system clock (UTC), all fields verified: %s%s\n' \
+        "$(wp_rtc_read)" "$(wp_utc_note)"
     ;;
 
 get)

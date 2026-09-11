@@ -51,7 +51,7 @@ if [ -z "${WITTYPI_GUARANTEED_WAKE+x}" ] && [ -r "$WP_AUDIT_ENV" ]; then
 fi
 wp_load_board_env >/dev/null 2>&1 || true
 
-echo "── wittypi-audit — $(date -u '+%Y-%m-%d %H:%M:%S') UTC ──────────────────────"
+echo "── wittypi-audit — $(date -u '+%Y-%m-%d %H:%M:%S') UTC$(wp_utc_note) ──────────────"
 
 # ── board ──────────────────────────────────────────────────────────────────
 if wp_a_id=$(wp_board_id); then
@@ -121,11 +121,12 @@ case "$wp_a2_s$wp_a2_m$wp_a2_h$wp_a2_d" in
             echo 'alarm2      no shutdown scheduled'
             wp_a2_state=none
         else
-            printf 'alarm2      SHUTDOWN scheduled: day %02d at %02d:%02d:%02d UTC\n' \
+            printf 'alarm2      SHUTDOWN scheduled: day %02d at %02d:%02d:%02d UTC%s\n' \
                 "$wp_a2_dd" \
                 "$(( (wp_a2_h / 16) * 10 + (wp_a2_h % 16) ))" \
                 "$(( (wp_a2_m / 16) * 10 + (wp_a2_m % 16) ))" \
-                "$(( (wp_a2_s / 16) * 10 + (wp_a2_s % 16) ))"
+                "$(( (wp_a2_s / 16) * 10 + (wp_a2_s % 16) ))" \
+                "$(wp_utc_note)"
             wp_a2_state=armed
         fi
         ;;

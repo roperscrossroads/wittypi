@@ -322,5 +322,5 @@ fi
 # Absolute instants, not "+Ns" offsets: the appointments are phase-anchored
 # now, so an offset from an unstated origin is the one rendering that cannot
 # be checked against the registers a human is about to read.
-wp_log "schedule: cycle ON ${wp_sched_on}s / OFF ${wp_sched_off}s, RTC $wp_sched_now — shutdown $(date -u -d "@$wp_sched_stop" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) UTC (in $(( wp_sched_stop - wp_sched_now_s ))s), wake $(date -u -d "@$wp_sched_wake" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) UTC"
+wp_log "schedule: cycle ON ${wp_sched_on}s / OFF ${wp_sched_off}s, RTC $wp_sched_now — shutdown $(date -u -d "@$wp_sched_stop" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) UTC (in $(( wp_sched_stop - wp_sched_now_s ))s), wake $(date -u -d "@$wp_sched_wake" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) UTC$(wp_utc_note)"
 exit 0

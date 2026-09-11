@@ -407,8 +407,9 @@ wp_watch_alarm() {
     fi
     wp_watch_a_ts=$(( wp_watch_add * 86400 + $(wp_bcd2dec "$wp_watch_ah") * 3600 \
                     + $(wp_bcd2dec "$wp_watch_am") * 60 + $(wp_bcd2dec "$wp_watch_as") ))
-    wp_watch_a_desc=$(printf 'day %02d at %02d:%02d:%02d UTC' "$wp_watch_add" \
-        "$(wp_bcd2dec "$wp_watch_ah")" "$(wp_bcd2dec "$wp_watch_am")" "$(wp_bcd2dec "$wp_watch_as")")
+    wp_watch_a_desc=$(printf 'day %02d at %02d:%02d:%02d UTC%s' "$wp_watch_add" \
+        "$(wp_bcd2dec "$wp_watch_ah")" "$(wp_bcd2dec "$wp_watch_am")" \
+        "$(wp_bcd2dec "$wp_watch_as")" "$(wp_utc_note)")
     return 0
 }
 

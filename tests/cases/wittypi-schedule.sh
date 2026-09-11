@@ -99,6 +99,7 @@ run_sched() {
         WITTYPI_SCHEDULE_LIB="$LIB" \
         WITTYPI_SCHEDULE_ENV="$_f/data/wittypi-schedule.env" \
         WITTYPI_SCHEDULE_TERMS="$_f/terms" \
+        WITTYPI_SITE_ENV="$_f/data/wittypi.env" \
         WITTYPI_SCHEDULE_NOTIFY="$_f/bin/notify" \
         PROC_UPTIME="$_f/proc/uptime" \
         sh "$SCHED" "$@" 2>&1
@@ -705,3 +706,42 @@ else
         "installed but not shipped:$_missing — do_package will fail with a QA error"
 fi
 fi
+
+# ── the UTC display note ──────────────────────────────────────────────────
+# Cosmetic, but it rides on every timestamp the fleet reads at 3am, so the
+# two states that matter are pinned: absent by default (a shared driver must
+# not carry one deployment's timezone), and appended verbatim when a site
+# states one. The note is a CONSTANT STRING — there is no conversion here to
+# test, which is exactly why this is three assertions and not a date suite.
+
+describe "no site note: timestamps render bare UTC, byte-for-byte as before"
+F=$(sched_fixture)
+run_sched "$F"
+assert_contains "$RUN_OUT" 'day 13 at 23:11:00 UTC' "the wake renders"
+# NOT a bare 'UTC (' — the cycle summary legitimately renders "UTC (in 1881s)".
+# The negative has to name the instant it is guarding.
+assert_not_contains "$RUN_OUT" '23:11:00 UTC (' "and carries no annotation nobody configured"
+fixture_rm "$F"
+
+describe "WITTYPI_TZ_NOTE in the site env is appended to every rendered instant"
+F=$(sched_fixture)
+printf 'WITTYPI_TZ_NOTE=ET:-4/-5\n' > "$F/data/wittypi.env"
+run_sched "$F"
+assert_contains "$RUN_OUT" 'armed register-27 alarm for day 13 at 23:11:00 UTC (ET:-4/-5)' \
+    "the wake carries it"
+assert_contains "$RUN_OUT" 'armed register-32 alarm for day 13 at 22:41:00 UTC (ET:-4/-5)' \
+    "so does the shutdown"
+assert_contains "$RUN_OUT" 'wake 2026-08-13 23:11:00 UTC (ET:-4/-5)' \
+    "and the cycle summary carries it too"
+fixture_rm "$F"
+
+describe "a quoted value is accepted and the quotes stripped, not printed"
+# EnvironmentFile= strips quotes before a unit ever sees them, so a line
+# copied out of a systemd-fed config arrives here quoted. Printing
+# ("ET:-4/-5") would look like a bug in the tool rather than in the config.
+F=$(sched_fixture)
+printf 'WITTYPI_TZ_NOTE="ET:-4/-5"\n' > "$F/data/wittypi.env"
+run_sched "$F"
+assert_contains "$RUN_OUT" 'UTC (ET:-4/-5)' "rendered unquoted"
+assert_not_contains "$RUN_OUT" '("ET' "the quotes did not survive into the output"
+fixture_rm "$F"

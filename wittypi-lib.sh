@@ -548,6 +548,53 @@ wp_log_err() {
     fi
 }
 
+# wp_utc_note — the deployment's UTC annotation, ready to append.
+#
+# Everything in this tree renders UTC and only UTC: the alarm registers are
+# UTC, the firmware's match is UTC, and timing-windows spells out why (a DST
+# conversion is a 3600s discontinuity against a far smaller tolerance). But a
+# human reading `03:00:00 UTC` off a serial console at 3am still has to do the
+# offset in their head, and that is where the mistakes are.
+#
+# So a site states its offsets ONCE and every timestamp carries them:
+#
+#     /data/wittypi.env:   WITTYPI_TZ_NOTE=ET:-4/-5
+#     output:              day 12 at 03:00:00 UTC (ET:-4/-5)
+#
+# ⚠️ A CONSTANT STRING, NOT A CONVERSION — that is the whole point. It needs no
+# tzdata (this image has none), never asks which of EDT/EST is in force today,
+# and has no DST branch to be wrong in. It computes nothing, so it cannot drift.
+#
+# ⚠️ EMPTY BY DEFAULT, because offsets are a fact about a DEPLOYMENT and not
+# about a Witty Pi 4. A driver that hardcoded one site's timezone would be the
+# same category error the board-calibration registry exists to prevent.
+#
+# The leading space lives INSIDE the note, so every caller appends
+# unconditionally and an unset note leaves the line byte-for-byte as it was.
+WP_SITE_ENV="${WITTYPI_SITE_ENV:-/data/wittypi.env}"
+wp_utc_note() {
+    if [ -z "${WP_UTC_NOTE_READ:-}" ]; then
+        WP_UTC_NOTE_READ=1
+        # Environment wins (a bench override), then the site file — the same
+        # precedence wittypi-audit already uses, and the same refusal to
+        # EXECUTE a config file: it is grepped, never sourced.
+        if [ -z "${WITTYPI_TZ_NOTE+x}" ] && [ -r "$WP_SITE_ENV" ]; then
+            WITTYPI_TZ_NOTE=$(sed -n 's/^WITTYPI_TZ_NOTE=//p' "$WP_SITE_ENV" | sed -n 1p)
+        fi
+        WITTYPI_TZ_NOTE="${WITTYPI_TZ_NOTE:-}"
+        # systemd's EnvironmentFile= accepts quotes and strips them before the
+        # value reaches a unit, so a line copied from there may arrive quoted.
+        # Strip one matching pair rather than printing ("ET:-4/-5").
+        case "$WITTYPI_TZ_NOTE" in
+            \"*\") WITTYPI_TZ_NOTE=${WITTYPI_TZ_NOTE#\"}; WITTYPI_TZ_NOTE=${WITTYPI_TZ_NOTE%\"} ;;
+            \'*\') WITTYPI_TZ_NOTE=${WITTYPI_TZ_NOTE#\'}; WITTYPI_TZ_NOTE=${WITTYPI_TZ_NOTE%\'} ;;
+        esac
+    fi
+    [ -n "$WITTYPI_TZ_NOTE" ] && printf ' (%s)' "$WITTYPI_TZ_NOTE"
+    # Never let an absent note look like a failure to a caller under set -e.
+    return 0
+}
+
 # ── I2C ────────────────────────────────────────────────────────────────────
 # i2cget prints hex ("0x26"). POSIX arithmetic expansion parses that directly,
 # which avoids depending on whether this image's printf accepts 0x for %d —
@@ -775,7 +822,7 @@ wp_arm_alarm() {
     fi
 
     wp_set "$wp_aa_flag" 0
-    wp_log "armed register-$wp_aa_base alarm for day $wp_aa_d at $wp_aa_h:$wp_aa_m:$wp_aa_s UTC"
+    wp_log "armed register-$wp_aa_base alarm for day $wp_aa_d at $wp_aa_h:$wp_aa_m:$wp_aa_s UTC$(wp_utc_note)"
     return 0
 }
 
