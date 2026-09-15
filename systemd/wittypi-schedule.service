@@ -28,8 +28,10 @@ After=data.mount
 # configure second (its policy writes and stale-flag block must settle
 # before anything reads the alarm block). Deliberately NOT
 # Before=wittypi.service: SYS_UP must reach the MCU early, and the flock
-# plus the lib's glitch-tolerant reads make daemon concurrency safe — the
-# daemon never writes a register.
+# plus the lib's glitch-tolerant reads make the daemon's boot-time reads safe.
+# ⚠️ The daemon DOES write, but only after a halt request: it runs
+# `wake-guard ensure` (WITTYPI_WAKE_GUARD), which may arm a fallback alarm1
+# and pre-arm alarm2 under the same lock. Nothing it does at boot writes.
 After=wittypi-clock.service wittypi-configure.service
 
 # After=wake-guard.service is a STOP-order directive — the same derivation as

@@ -1066,13 +1066,13 @@ distribution, a security-hardened image), this is the shape that works:
 ```
 data.mount
    │
-   ├─ wittypi-configure.service   oneshot   assert the register policy
+   ├─ wittypi-clock.service       oneshot   sync system clock from the RTC (first)
    │
-   ├─ wittypi-clock.service       oneshot   sync system clock from the RTC
+   ├─ wittypi-configure.service   oneshot   assert the register policy (After=clock, Before=wittypi)
    │
-   ├─ wittypi-schedule.service    oneshot   write alarm1, then alarm2
+   ├─ wittypi.service             simple    signal boot, wait, gate, power off
    │
-   └─ wittypi.service             simple    signal boot, wait, gate, power off
+   └─ wittypi-schedule.service    oneshot   write alarm1, then alarm2 (After=clock, configure)
           │
           └─ your own work: ordinary units, After=wittypi.service
 ```

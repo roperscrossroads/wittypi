@@ -60,9 +60,12 @@
 #      firmware's 2-second window means a missed alarm does not fire late,
 #      it does not fire at all, and nothing else detects the miss (an
 #      alarm2 consumed while the rail was down, or a clock step across the
-#      appointment). Alarm1 in the past is
-#      log-only: the MCU defers a wake that fires while the node is up and
-#      re-fires it ~4 s after the next power-off, so that state self-heals.
+#      appointment). Alarm1 in the past is log-only, but for two different
+#      reasons: an alarm1 that came due WHILE THIS BOOT WAS UP is remembered
+#      by the MCU and re-fires ~4 s after the next power-off (reason 8); the
+#      alarm1 that STARTED this boot is not remembered at all, and is renewed
+#      by the scheduler at boot, repaired by wake-keeper, and backed by the
+#      fallback wake-guard arms at shutdown.
 #
 # No trap handlers, deliberately — and a test asserts it stays that way.
 # wittypi-watch.service is stopped BEFORE wake-guard.service's ExecStop runs
@@ -206,7 +209,7 @@ wp_watch_repair() {
     # and do nothing, which is the worst of the three possible outcomes.
     #
     # --no-block, and it is not an optimisation. wittypi-schedule allows
-    # itself TimeoutStartSec=30 for a glitchy-bus RTC read; this unit's whole
+    # itself TimeoutStartSec=60 for a glitchy-bus RTC read; this unit's whole
     # budget is TimeoutStartSec=10. Waiting would let a slow-but-working
     # repair blow the watch's own timeout and get this script SIGTERMed
     # mid-tick — killing the supervisor to fix the thing it supervises. So
@@ -497,13 +500,15 @@ if [ -r "$WP_WATCH_SCHEDULE" ]; then
                 else
                     wp_log "watch: alarm2 armed for $wp_watch_sched_desc"
                 fi
-                # Alarm1 in the past is LOG-ONLY: the MCU defers a wake that
-                # fired while up and re-fires it ~4 s after the next
-                # power-off (reason 8), so this state heals itself.
+                # Alarm1 in the past is LOG-ONLY. If it came due while this
+                # boot was up, the MCU re-fires it ~4 s after the next
+                # power-off (reason 8). If it is the wake that started this
+                # boot, nothing re-fires it: the scheduler renews it at boot,
+                # and wake-guard arms a fallback at shutdown.
                 if wp_watch_alarm 27; then
                     wp_watch_over1=$(( wp_watch_sn_ts - wp_watch_a_ts ))
                     if [ "$wp_watch_over1" -gt 5 ] && [ "$wp_watch_over1" -le 1209600 ]; then
-                        wp_log "watch: alarm1 ($wp_watch_a_desc) is in the past — the MCU will re-fire it ~4s after the next power-off; the scheduler renews it at boot"
+                        wp_log "watch: alarm1 ($wp_watch_a_desc) is in the past — if it came due while up the MCU re-fires it ~4s after the next power-off; otherwise the scheduler renews it and wake-guard arms a fallback at shutdown"
                     fi
                 fi
             fi

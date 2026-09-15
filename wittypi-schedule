@@ -136,7 +136,7 @@ fi
 # a caller willing to wait for the device to exist.
 #
 # Costs nothing on a healthy boot: the first probe succeeds and the loop is
-# never entered. The bound is well inside the unit's TimeoutStartSec=30, and
+# never entered. The bound is well inside the unit's TimeoutStartSec=60, and
 # none of this is on the shutdown clock.
 WP_SCHED_PROBE_TRIES="${WITTYPI_SCHEDULE_PROBE_TRIES:-10}"
 wp_sched_try=1
