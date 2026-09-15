@@ -83,3 +83,10 @@ if have "${UNITS_DIR:-}/wake-guard" "wake-guard — the integration layer owns i
 assert_contains "$GUARD_TEXT" "flock -w 1 9" \
     "wake-guard waits at most 1s for the lock before treating it as unreadable"
 fi
+
+describe "rtc-save orders on the clock unit, not on a target nothing pulls in"
+t=$(grep -v '^[[:space:]]*#' "$RPI_SYSTEMD_DIR/wittypi-rtc-save.service")
+assert_contains "$t" "After=wittypi-clock.service" "After=wittypi-clock.service"
+assert_not_contains "$t" "time-sync.target" "no inert After=time-sync.target"
+assert_contains "$t" "ConditionPathExists=/run/systemd/timesync/synchronized" "the sync marker is still the gate"
+

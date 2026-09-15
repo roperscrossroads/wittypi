@@ -26,7 +26,17 @@ Description=Write the system clock back to the Witty Pi 4 RTC
 # Kept as a Condition rather than a Requires so the skip is quiet and visible
 # (`systemctl status` reports a condition-check skip) rather than a failed
 # unit on a board that's behaving correctly.
-After=time-sync.target
+#
+# ⚠️ No After=time-sync.target. It used to be here and did nothing: an After=
+# on a target only orders against a JOB for that target, and nothing on these
+# images pulls time-sync.target in (systemd-time-wait-sync is not enabled), so
+# the edge was never in any transaction. The .path unit is the real gate.
+#
+# After=wittypi-clock.service instead: the boot read of the RTC and this write
+# of it must never interleave, and a sync that lands while the clock unit is
+# still waiting for the controller would otherwise start this in parallel,
+# serialised only by the lock.
+After=wittypi-clock.service
 ConditionPathExists=/run/systemd/timesync/synchronized
 Conflicts=shutdown.target
 Before=shutdown.target
