@@ -62,17 +62,22 @@ Before=shutdown.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# The flock is what keeps every other current and future I2C accessor out of
-# this window, rather than requiring each new one to be added to an
-# ever-growing explicit ordering chain.
 # Wait up to 15 s for the controller to answer before giving up: early in boot
 # it did not, in 7 of 10 boots on 2026-09-15, and the clock then stayed at the
-# last saved time until NTP. The wait holds the lock, but nothing else is on the
-# bus this early (configure is ordered after this unit).
+# last saved time until NTP. The probe runs BEFORE the lock is taken, so a
+# board with no controller never holds the bus lock while it waits.
 Environment=WITTYPI_PROBE_SEC=15
-# flock wait 10 + probe 15 + a confirmed RTC read (~5 s measured) = 30, under 60.
+# The I2C lock is taken by the tool itself, shared, once the controller has
+# answered: `wittypi rtc-sync` holds it for the confirmed RTC read only. It is
+# what keeps every other current and future I2C accessor out of that window,
+# rather than an ever-growing explicit ordering chain. 15 s is the boot-time
+# class; nothing here is on the shutdown clock. A lock it cannot get is exit
+# 75, deliberately NOT a success below: a boot whose clock was never read
+# must show.
+Environment=WITTYPI_LOCK_WAIT=15
+# probe 15 + lock 15 + a confirmed RTC read (~5 s measured) = 35, under 60.
 TimeoutStartSec=60
-ExecStart=/usr/bin/flock -w 10 /run/wittypi.lock /usr/bin/wittypi rtc-sync
+ExecStart=/usr/bin/wittypi rtc-sync
 
 # `wittypi rtc-sync` exits 1 for two legitimate cases: no controller fitted,
 # and an RTC that has lost power and reads its 2000-01-01 epoch (it refuses

@@ -33,6 +33,13 @@ usage: wittypi <command> [args]
                       Prefer: systemctl restart wittypi-configure.service —
                       only the UNIT loads /data/wittypi.env. Run bare, this
                       applies COMPILED defaults and ignores every site value.
+                      Typed at a prompt it therefore REFUSES unless given
+                      --compiled-defaults, which says you know that.
+  halt-status         0 when no power-off is under way, 1 when one is (prints
+                      the halt marker). No I2C, no lock: an ExecCondition=.
+Every command that touches the bus takes the I2C lock itself: readers shared,
+writers exclusive, for WITTYPI_LOCK_WAIT seconds (10 for a read, 20 for a
+write, 15 for rtc-sync). A lock it cannot get is exit 75, never silence.
 
 The RTC and the temperature sensor are NOT on the Pi's I2C bus — they sit on
 the MCU's internal bus and are proxied as registers 50-71 of 0x08. That is why
@@ -76,6 +83,54 @@ wp_require() {
         printf 'Check it is fitted, and that i2cdetect -y %s shows 0x08.\n' "$WP_BUS" >&2
         exit 1
     }
+}
+
+# ── The lock, per subcommand ───────────────────────────────────────────────
+# Readers take it shared, writers exclusive, IN-SCRIPT: the units no longer
+# wrap ExecStart in flock (a wrapper plus this would wait on itself). The
+# probe in wp_require is one register read, exempt, and runs before the lock
+# so a board with no controller never holds the bus lock while it fails.
+# WITTYPI_LOCK_WAIT overrides the wait: a caller on the shutdown clock passes
+# 1, the clock unit 15. A child of a holder (the scheduler running
+# `wittypi get`) inherits the lock and is covered at once — wp_lock's rule.
+wp_cli_lock() { # <s|x> <default-wait>
+    wp_lock "$1" "${WITTYPI_LOCK_WAIT:-$2}" "wittypi $WP_CMD" || exit "$WP_EX_LOCK"
+}
+
+# ── Standing down ──────────────────────────────────────────────────────────
+# A write asked for while a power-off is under way — the halt marker, written
+# by the daemon the moment the controller asks, or by the shutdown gate — is
+# refused with 69 and writes nothing: from that moment the shutdown path owns
+# the registers, and the one unit that can legitimately be started then
+# (rtc-save, by its .path) lists 69 as success. Reads carry on.
+wp_cli_stand_down() {
+    wp_halt_read >/dev/null || return 0
+    wp_log_err "wittypi $WP_CMD: standing down — a halt is requested by $(sed -n 's/^source=//p' "$WP_HALT_MARKER" | sed -n 1p); the shutdown path owns the registers now"
+    exit "$WP_EX_STANDDOWN"
+}
+
+# ── TERM during a write sequence ───────────────────────────────────────────
+# The same rule as wp_arm_alarm: a stop that arrives mid-sequence is NOTED
+# (the trap sets wp_term), the sequence reaches a state that is whole and
+# verified, and only then does the process exit 143. rtc-write finishes all
+# six fields; configure finishes the register in hand. Never a half-written
+# clock, never a table torn between two boots' policies.
+wp_cli_term_done() { # <rc> — call once the registers are settled
+    trap - TERM INT
+    if [ "${wp_term:-0}" = 1 ]; then
+        wp_log "wittypi $WP_CMD: TERM received during the writes — finished them first (rc $1), exiting 143"
+        exit 143
+    fi
+    return 0
+}
+
+# ── "Interactive" is a human at a prompt ───────────────────────────────────
+# Not under systemd (no INVOCATION_ID) and a terminal on stdin. That is the
+# one caller that does not get /data/wittypi.env, so it is the one that must
+# say --compiled-defaults out loud. WITTYPI_INTERACTIVE=1 forces it (tests).
+wp_cli_interactive() {
+    [ -n "${WITTYPI_INTERACTIVE:-}" ] && return 0
+    [ -z "${INVOCATION_ID:-}" ] && [ -t 0 ]
 }
 
 # Volts -> the register's x10 encoding. Uses integer arithmetic on the decimal
@@ -408,8 +463,13 @@ wp_policy() {
         #
         # This is a function of the LONGEST INTENDED SLEEP — revisit it if
         # the schedule ever sleeps longer than about a day.
+        # /run/wittypi/policy.env (the value wake-policy derived from the
+        # schedule) wins over the site's own line — it floors it. Then the
+        # environment, then the compiled fallback. wp_guaranteed_wake_policy
+        # in the lib is the one precedence rule; the audit and the keeper use it.
+        wp_p_gw=$(wp_guaranteed_wake_policy | cut -f1)
         wp_emit "$WP_REG_GUARANTEED_WAKE" \
-            "$(wp_dec10 "${WITTYPI_GUARANTEED_WAKE:-$WP_FALLBACK_GUARANTEED_WAKE}")" 'guaranteed wake (h)'
+            "$(wp_dec10 "${wp_p_gw:-${WITTYPI_GUARANTEED_WAKE:-$WP_FALLBACK_GUARANTEED_WAKE}}")" 'guaranteed wake (h)'
     else
         printf 'WARNING: firmware predates guaranteed wake; register %s left alone.\n' \
             "$WP_REG_GUARANTEED_WAKE" >&2
@@ -474,9 +534,11 @@ wp_policy() {
     return 0
 }
 
-case "${1:-}" in
+WP_CMD="${1:-}"
+case "$WP_CMD" in
 status)
     wp_require
+    wp_cli_lock s 10
     printf 'firmware id       0x%02x\n' "$(wp_get "$WP_REG_ID")"
     wp_rev=$(wp_get "$WP_REG_FW_REVISION")
     printf 'firmware revision %s\n' "$wp_rev"
@@ -507,6 +569,7 @@ status)
 
 rtc)
     wp_require
+    wp_cli_lock s 10
     # wp_rtc_read_confirmed fails for THREE different reasons now, and saying
     # "year reads 00" for all of them would send someone to the coin cell when
     # the real fault was a glitched read or a torn timestamp. It logs the
@@ -532,6 +595,7 @@ rtc)
 
 temp)
     wp_require
+    wp_cli_lock s 10
     wp_c=$(wp_temp_c) || { echo "could not read the temperature register" >&2; exit 1; }
     printf '%s°C\n' "$wp_c"
     ;;
@@ -552,6 +616,7 @@ rtc-sync)
         printf 'Check it is fitted, and that i2cdetect -y %s shows 0x08.\n' "$WP_BUS" >&2
         exit 1
     }
+    wp_cli_lock s 15
     # ── Name the cause that actually happened ──────────────────────────────
     # A version of this used to say "it has lost power" for EVERY failure,
     # including when the real fault was a torn read (wp_rtc_read straddling
@@ -636,6 +701,8 @@ rtc-write)
     # comparisons below race-free in practice; seconds itself is then the only
     # field that may legitimately have advanced, and is checked loosely.
     wp_require
+    wp_cli_stand_down
+    wp_cli_lock x 20
 
     # ── Refuse to persist a clock the board does not actually have ─────────
     # A version of this has actually run this way: on a first boot, with
@@ -675,6 +742,8 @@ rtc-write)
     set -- $wp_now
 
     wp_rc=0
+    wp_term=0
+    trap 'wp_term=1' TERM INT
 
     # wp_wr_field <register> <decimal value> <label>
     wp_wr_field() {
@@ -709,14 +778,17 @@ rtc-write)
     if [ "$wp_rc" -ne 0 ]; then
         printf 'RTC WRITE FAILED — reads back %s\n' "$(wp_rtc_read)" >&2
         printf 'The clock this board falls back on across a power cut is WRONG.\n' >&2
-        exit 1
+        wp_cli_term_done 2
+        exit 2
     fi
     printf 'RTC set from system clock (UTC), all fields verified: %s%s\n' \
         "$(wp_rtc_read)" "$(wp_utc_note)"
+    wp_cli_term_done 0
     ;;
 
 get)
     wp_require
+    wp_cli_lock s 10
     [ $# -eq 2 ] || { wp_usage; exit 1; }
     wp_r=$(wp_reg_num "$2") || exit 2
     # wp_get_maybe_stable: outvotes a one-off glitch (the same 0x00-then-0x01
@@ -729,6 +801,8 @@ get)
 
 set)
     wp_require
+    wp_cli_stand_down
+    wp_cli_lock x 20
     [ $# -eq 3 ] || { wp_usage; exit 1; }
     wp_r=$(wp_reg_num "$2") || exit 2
     wp_set "$wp_r" "$3"
@@ -745,6 +819,7 @@ names)
 
 regs)
     wp_require
+    wp_cli_lock s 10
     # `regs` prints the registers this DESIGN uses; `regs --all` adds the ones
     # it does not, which is what a backup or an investigation wants — an
     # unrecognised factory value hides precisely where nothing looks.
@@ -777,6 +852,7 @@ check)
     # Read-only. The delta, not a summary — because on this board "applied" and
     # "still at the factory default" look identical from the outside.
     wp_require
+    wp_cli_lock s 10
     # Board-registry calibration first: fills only what the environment leaves
     # unset, so /data/wittypi.env (injected by the unit) always wins. The
     # delta below is then computed against the same effective intent
@@ -836,6 +912,20 @@ configure)
     # which for these rows can be a brownout on an unattended, unreachable
     # board.
     wp_require
+    # ── The refusal a prompt gets ──────────────────────────────────────────
+    # Only the UNIT loads /data/wittypi.env. Typed at a prompt this would
+    # apply compiled defaults over the site's values — 26 h into register 49
+    # on a node whose schedule needs 16 — and the keeper would spend ten
+    # minutes undoing it. So a human must say what they are doing.
+    if [ "${2:-}" != "--compiled-defaults" ] && wp_cli_interactive; then
+        printf 'REFUSING: a bare "wittypi configure" at a prompt applies COMPILED defaults\n' >&2
+        printf 'and ignores every site value, because only the unit loads /data/wittypi.env.\n' >&2
+        printf 'Meant that?  wittypi configure --compiled-defaults\n' >&2
+        printf 'Meant the site policy?  systemctl restart wittypi-configure.service\n' >&2
+        exit 64
+    fi
+    wp_cli_stand_down
+    wp_cli_lock x 20
     # Board-registry calibration first — same call, same precedence as
     # `check`, so what check compares is what configure applies. The
     # environment (the unit's /data/wittypi.env) always wins; the registry
@@ -859,6 +949,8 @@ configure)
     wp_sanity "$wp_pol" || exit $?
 
     wp_rc=0
+    wp_term=0
+    trap 'wp_term=1' TERM INT
     while IFS="$WP_TAB" read -r wp_r wp_v wp_l; do
         [ -n "$wp_r" ] || continue
         # wp_get_maybe_stable, same reasoning as `check`: every register
@@ -878,6 +970,14 @@ configure)
             printf '  FAIL %3s  %-38s wrote %s, reads back %s\n' \
                 "$wp_r" "$wp_l" "$wp_v" "$wp_new" >&2
             wp_rc=2
+        fi
+        # A stop mid-table: this register is whole and verified; the rest of
+        # the table waits for the next boot's run. Better than a table torn
+        # between two policies, and far better than a write cut by KILL.
+        if [ "$wp_term" = 1 ]; then
+            trap - TERM INT
+            wp_log "wittypi configure: TERM received — register $wp_r finished and verified, the rest of the table left for the next run, exiting 143"
+            exit 143
         fi
     done <<EOF
 $wp_pol
@@ -902,7 +1002,20 @@ EOF
     fi
 
     [ "$wp_rc" -eq 0 ] || printf 'SOME REGISTERS DID NOT TAKE — the policy is NOT applied.\n' >&2
+    wp_cli_term_done "$wp_rc"
     exit "$wp_rc"
+    ;;
+halt-status)
+    # No I2C and no lock: this is the ExecCondition= for the units that stand
+    # down while a power-off is under way (WITTYPI-ACCESS-AUDIT.md §H2). 0 is
+    # "no halt requested — run"; 1 is "one is", with the marker printed. A
+    # marker over 120 s old is stale: removed, and counted as none.
+    if wp_hs=$(wp_halt_read); then
+        printf 'halt requested:\n%s\n' "$wp_hs" | sed '2,$s/^/  /'
+        exit 1
+    fi
+    printf 'no halt requested\n'
+    exit 0
     ;;
 
 *)

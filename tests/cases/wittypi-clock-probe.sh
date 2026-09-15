@@ -45,6 +45,7 @@ stub_probe() {
 clock() { # <fixture> <probe-sec>
     RUN_OUT=$(PATH="$1/bin:$PATH" WITTYPI_LIB="$RPI_UNITS_DIR/wittypi-lib.sh" \
         WITTYPI_I2C_DEV="$1/dev-i2c-1" WITTYPI_PROBE_SEC="$2" INVOCATION_ID=x \
+        WITTYPI_LOCK="$1/lock" WITTYPI_RUN_DIR="$1/run" \
         sh "$RPI_UNITS_DIR/wittypi" rtc-sync 2>&1)
     RUN_RC=$?
 }
@@ -96,7 +97,18 @@ u=$(cat "$RPI_SYSTEMD_DIR/wittypi-clock.service")
 assert_contains "$u" "Environment=WITTYPI_PROBE_SEC=15" "WITTYPI_PROBE_SEC=15"
 probe=$(printf '%s\n' "$u" | sed -n 's/^Environment=WITTYPI_PROBE_SEC=//p')
 start=$(printf '%s\n' "$u" | sed -n 's/^TimeoutStartSec=//p')
-lockw=$(printf '%s\n' "$u" | sed -n 's|^ExecStart=/usr/bin/flock -w \([0-9]*\) .*|\1|p')
+lockw=$(printf '%s\n' "$u" | sed -n 's/^Environment=WITTYPI_LOCK_WAIT=//p')
+assert_contains "$u" "ExecStart=/usr/bin/wittypi rtc-sync" "ExecStart is the bare tool: it takes the lock itself, after the probe"
+assert_eq "15" "$lockw" "WITTYPI_LOCK_WAIT=15"
+assert_not_contains "$(printf '%s\n' "$u" | grep -v '^#')" "flock" "no flock wrapper"
+sync_body=$(sed -n '/^rtc-sync)/,/^rtc-write)/p' "$RPI_UNITS_DIR/wittypi")
+probe_ln=$(printf '%s\n' "$sync_body" | grep -n 'wp_wait_present' | cut -d: -f1 | head -n 1)
+lock_ln=$(printf '%s\n' "$sync_body" | grep -n 'wp_cli_lock s 15' | cut -d: -f1 | head -n 1)
+if [ -n "$probe_ln" ] && [ -n "$lock_ln" ] && [ "$probe_ln" -lt "$lock_ln" ]; then
+    ok "rtc-sync probes for the controller BEFORE it takes the lock (lines $probe_ln < $lock_ln)"
+else
+    notok "rtc-sync probes before it locks" "probe at ${probe_ln:-none}, lock at ${lock_ln:-none}"
+fi
 if [ -n "$start" ] && [ -n "$probe" ] && [ "$start" -ge $(( ${lockw:-0} + probe + 10 )) ]; then
     ok "TimeoutStartSec $start >= lock ${lockw:-0} + probe $probe + 10 for the RTC read"
 else

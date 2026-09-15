@@ -268,10 +268,16 @@ fi
 # (/data/wittypi.env — the same file wittypi-configure reads, so the watch
 # compares against the SAME intent the boot applied). Unset is fine:
 # wp_check_guaranteed_wake still requires the register readable and enabled.
-wp_watch_gw=$(wp_check_guaranteed_wake "${WITTYPI_GUARANTEED_WAKE:-}")
+# The expected value comes from the lib's one precedence rule (policy file,
+# then the environment, then the site file), so the watch compares against
+# the FLOORED value wake-policy derived, not a site line under the floor (F3).
+wp_watch_gw_pol=$(wp_guaranteed_wake_policy) || wp_watch_gw_pol=""
+wp_watch_gw_want=${wp_watch_gw_pol%	*}
+wp_watch_gw_src=${wp_watch_gw_pol#*	}
+wp_watch_gw=$(wp_check_guaranteed_wake "${wp_watch_gw_want:-}")
 case $? in
     0) wp_log "watch: guaranteed wake ok (register 49 = $wp_watch_gw)" ;;
-    1) wp_watch_hazard "guaranteed wake drifted: register 49 reads $wp_watch_gw, site policy says ${WITTYPI_GUARANTEED_WAKE:-?}" ;;
+    1) wp_watch_hazard "guaranteed wake drifted: register 49 reads $wp_watch_gw, site policy says ${wp_watch_gw_want:-?} (from ${wp_watch_gw_src:-nowhere})" ;;
     3) wp_watch_hazard "guaranteed wake DISABLED: register 49 reads 0 — the last-resort backstop is off" ;;
     *) wp_watch_hazard "guaranteed-wake register unreadable — the controller is not answering a plain read" ;;
 esac

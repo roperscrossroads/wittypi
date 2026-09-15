@@ -239,6 +239,10 @@ run_rpi_unit() {
         PROC_UPTIME="$_f/proc/uptime" \
         DEV_KMSG="$_f/log/kmsg" \
         WITTYPI_LIB="$RPI_UNITS_DIR/wittypi-lib.sh" \
+        WITTYPI_LOCK="$_f/lock" \
+        WITTYPI_RUN_DIR="$_f/run" \
+        WITTYPI_UPTIME="$_f/proc/uptime" \
+        WITTYPI_POLICY_ENV="$_f/policy.env" \
         sh "$RPI_UNITS_DIR/$_s" "$@" 2>&1
     )
     RUN_RC=$?

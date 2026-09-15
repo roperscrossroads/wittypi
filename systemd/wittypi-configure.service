@@ -53,13 +53,21 @@ RemainAfterExit=yes
 # battery legitimately has none, and the tool applies only the
 # topology-independent rows when it has no topology to work from.
 EnvironmentFile=-/data/wittypi.env
-# flock: this writes a whole register table, one register at a time, and any
-# other reader or writer of the same registers landing mid-table would see
-# (or race) a half-applied policy. /run is tmpfs — nothing to clean up across
-# a reboot, and a held lock can't outlive a crashed holder, since the kernel
-# drops it when the fd closes. 10s is generous here (this competes with
-# nothing else at boot, and is not on the shutdown clock).
-ExecStart=/usr/bin/flock -w 10 /run/wittypi.lock /usr/bin/wittypi configure
+# Register 49's derived value. An integration layer's wake-policy reads the
+# active schedule and writes /run/wittypi/policy.env with the floored
+# guaranteed-wake hours. Loaded AFTER the site file so it wins, as it must: a
+# site value under the floor is raised, not applied. Absent on a node with no
+# such layer, hence the '-'. The tool reads the same file itself, so a bare
+# run sees the same value (wp_guaranteed_wake_policy, the one precedence rule).
+EnvironmentFile=-/run/wittypi/policy.env
+# The I2C lock is taken by the tool itself, exclusive, for the whole table:
+# any other reader or writer of the same registers landing mid-table would
+# see (or race) a half-applied policy. /run is tmpfs — nothing to clean up
+# across a reboot, and a held lock can't outlive a crashed holder, since the
+# kernel drops it when the fd closes. The 20 s wait is the writers' class;
+# this competes with nothing else at boot and is not on the shutdown clock.
+# A TERM mid-table finishes the register in hand, verified, then exits 143.
+ExecStart=/usr/bin/wittypi configure
 
 # Exit 1 is how the tool reports "no controller on the bus", which is a
 # normal bench configuration and must not fail the boot.
@@ -67,7 +75,9 @@ ExecStart=/usr/bin/flock -w 10 /run/wittypi.lock /usr/bin/wittypi configure
 # Exit 2 is a contradictory site configuration, or a register that would not
 # take, and is deliberately NOT whitelisted — those must show in `systemctl
 # status` rather than being swallowed, since the one case this unit most
-# needs to surface is exactly the one a silent success would hide.
+# needs to surface is exactly the one a silent success would hide. Nor are
+# 75 (the lock could not be taken) or 69 (a power-off was under way): the
+# policy was not applied, and that must show too.
 SuccessExitStatus=0 1
 
 [Install]

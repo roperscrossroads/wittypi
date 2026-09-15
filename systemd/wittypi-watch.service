@@ -68,6 +68,10 @@ TimeoutStopSec=1
 # Optional (-): an unconfigured node still gets the readable-and-enabled
 # check, which is the load-bearing half.
 EnvironmentFile=-/data/wittypi.env
+# Register 49's derived value, written by an integration layer's wake-policy;
+# loaded after the site file so the FLOORED value is what the watch compares
+# against, not a site line under the floor.
+EnvironmentFile=-/run/wittypi/policy.env
 ExecStart=/usr/libexec/site/wittypi-watch
 
 # Exit 1 is "hazard found and reported" — the unit showing failed is the

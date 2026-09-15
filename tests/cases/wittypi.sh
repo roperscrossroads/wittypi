@@ -311,6 +311,9 @@ stub_i2c() {
         # WP_DROP_REG models the real failure: a write that silently does not
         # take, which is what the octal parse error produced.
         printf '[ "$4" = "${WP_DROP_REG:-none}" ] && exit 0\n'
+        # WP_DELAY_REG: the first write to that register takes 1 s — long
+        # enough to land a TERM while it is in flight.
+        printf 'if [ "$4" = "${WP_DELAY_REG:-none}" ] && [ ! -f "%s/delayed" ]; then : > "%s/delayed"; sleep 1; fi\n' "$1" "$1"
         printf 'printf "%%s\\n" "$5" > "%s/regs/$4"\n' "$1"
     } > "$1/bin/i2cset"
     {
@@ -343,7 +346,7 @@ stub_i2c "$F"
 export WP_DROP_REG=63                 # the month — exactly what the octal bug lost
 run_rpi_unit "$F" wittypi rtc-write
 unset WP_DROP_REG
-assert_eq "1" "$RUN_RC" "a dropped field exits non-zero"
+assert_eq "2" "$RUN_RC" "a dropped field is exit 2 — the code the unit refuses to list as success"
 assert_contains "$RUN_OUT" "FAILED" "names the field that did not take"
 assert_not_contains "$RUN_OUT" "all fields verified" \
     "it must not claim success — announcing 2026-00-13 as OK is the original defect"
@@ -1411,3 +1414,163 @@ else
     notok "it says why the bare command is wrong" \
         "a hint that just changes the command teaches nothing; the next person types the old one"
 fi
+
+# ═══ The lock, the halt marker and TERM, on the real CLI ═══════════════════
+# Contention uses a REAL flock holder in another process. run_rpi_unit points
+# WITTYPI_LOCK, WITTYPI_RUN_DIR and WITTYPI_UPTIME into the fixture.
+command -v flock >/dev/null 2>&1 && HAVE_FLOCK=1 || HAVE_FLOCK=
+
+describe "every subcommand that touches the bus takes the lock: a held exclusive lock is exit 75, and nothing is written"
+if [ -n "$HAVE_FLOCK" ]; then
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"; : > "$F/lock"
+flock -x "$F/lock" sleep 6 & HOLDER=$!
+sleep 0.3
+export WITTYPI_LOCK_WAIT=0 INVOCATION_ID=test WITTYPI_TOPOLOGY=vin3s
+for sub in "get 0" "regs" "status" "rtc" "temp" "check" "set 20 0" "rtc-write" "configure" "rtc-sync"; do
+    # shellcheck disable=SC2086
+    run_rpi_unit "$F" wittypi $sub
+    assert_eq "75" "$RUN_RC" "wittypi $sub: 75 against a holder"
+    assert_contains "$RUN_OUT" "<3>wittypi: wittypi ${sub%% *}: could not get the I2C lock" "and says so at err, naming the command"
+done
+assert_eq "" "$(stub_log "$F" i2cset)" "no write reached the bus"
+run_rpi_unit "$F" wittypi names
+assert_eq "0" "$RUN_RC" "names needs no lock"
+run_rpi_unit "$F" wittypi halt-status
+assert_eq "0" "$RUN_RC" "halt-status needs no lock either"
+unset WITTYPI_LOCK_WAIT INVOCATION_ID WITTYPI_TOPOLOGY
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+fixture_rm "$F"
+else printf '    SKIP flock not on this host\n'; fi
+
+describe "readers share: a held SHARED lock lets get through and keeps set out"
+if [ -n "$HAVE_FLOCK" ]; then
+F=$(fixture_new); stub_i2c "$F"; : > "$F/lock"
+flock -s "$F/lock" sleep 6 & HOLDER=$!
+sleep 0.3
+export WITTYPI_LOCK_WAIT=0
+run_rpi_unit "$F" wittypi get 0
+assert_eq "0" "$RUN_RC" "get beside a shared holder: 0"
+assert_eq "38" "$RUN_OUT" "and it read the register"
+run_rpi_unit "$F" wittypi set 20 0
+assert_eq "75" "$RUN_RC" "set beside a shared holder: 75"
+unset WITTYPI_LOCK_WAIT
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+fixture_rm "$F"
+else printf '    SKIP flock not on this host\n'; fi
+
+describe "rtc-sync probes before it locks: no controller means exit 1 at once, lock or no lock"
+if [ -n "$HAVE_FLOCK" ]; then
+F=$(fixture_new); stub_i2c "$F"; : > "$F/lock"
+printf '#!/bin/sh\necho "Error: Read failed" >&2; exit 1\n' > "$F/bin/i2cget"; chmod +x "$F/bin/i2cget"
+flock -x "$F/lock" sleep 6 & HOLDER=$!
+sleep 0.3
+export WITTYPI_LOCK_WAIT=5
+t0=$(date +%s); run_rpi_unit "$F" wittypi rtc-sync; t1=$(date +%s)
+assert_eq "1" "$RUN_RC" "exit 1: no controller"
+assert_contains "$RUN_OUT" "no Witty Pi at 0x08" "the old message"
+assert_not_contains "$RUN_OUT" "could not get the I2C lock" "the lock was never asked for"
+if [ $(( t1 - t0 )) -le 2 ]; then ok "and it did not wait the 5 s lock wait"; else notok "no lock wait without a controller" "took $(( t1 - t0 ))s"; fi
+unset WITTYPI_LOCK_WAIT
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+fixture_rm "$F"
+else printf '    SKIP flock not on this host\n'; fi
+
+describe "halt-status: 0 and 'no halt requested' without a marker; 1 and the marker with one; stale is none"
+F=$(fixture_new); printf '300.00 900.00\n' > "$F/proc/uptime"
+run_rpi_unit "$F" wittypi halt-status
+assert_eq "0" "$RUN_RC" "no marker: 0 (the unit runs)"
+assert_eq "no halt requested" "$RUN_OUT" "and says so"
+mkdir -p "$F/run"; printf 'source=daemon\nuptime=290\nreason=scheduled shutdown (alarm2)\nstate=pending\na1=\na2=\n' > "$F/run/halt-requested"
+run_rpi_unit "$F" wittypi halt-status
+assert_eq "1" "$RUN_RC" "a fresh marker: 1 (the unit is skipped)"
+assert_contains "$RUN_OUT" "halt requested:" "prints the verdict"
+assert_contains "$RUN_OUT" "  source=daemon" "and the marker, indented"
+assert_contains "$RUN_OUT" "  reason=scheduled shutdown (alarm2)" "with its reason"
+printf '500.00 900.00\n' > "$F/proc/uptime"
+run_rpi_unit "$F" wittypi halt-status
+assert_eq "0" "$RUN_RC" "210 s after the marker: stale, so 0"
+assert_file_absent "$F/run/halt-requested" "and the stale marker is gone"
+fixture_rm "$F"
+
+describe "set, rtc-write and configure stand down under a halt: 69, nothing written; reads carry on"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"; printf '300.00 900.00\n' > "$F/proc/uptime"
+mkdir -p "$F/run"; printf 'source=gate\nuptime=299\nreason=poweroff\n' > "$F/run/halt-requested"
+export INVOCATION_ID=test WITTYPI_TOPOLOGY=vin3s
+for sub in "set 20 0" "rtc-write" "configure"; do
+    # shellcheck disable=SC2086
+    run_rpi_unit "$F" wittypi $sub
+    assert_eq "69" "$RUN_RC" "wittypi $sub: 69"
+    assert_contains "$RUN_OUT" "<3>wittypi: wittypi ${sub%% *}: standing down — a halt is requested by gate" "logged at err, naming the source"
+done
+assert_eq "" "$(stub_log "$F" i2cset)" "nothing was written"
+run_rpi_unit "$F" wittypi get 0
+assert_eq "0" "$RUN_RC" "get still works"
+unset INVOCATION_ID WITTYPI_TOPOLOGY
+fixture_rm "$F"
+
+describe "rtc-write under TERM: all six fields land and are verified, then exit 143"
+F=$(fixture_new); stub_i2c "$F"
+export WP_DELAY_REG=60
+PATH="$F/bin:$PATH" WITTYPI_LIB="$LIB" WITTYPI_LOCK="$F/lock" WITTYPI_RUN_DIR="$F/run" \
+    sh "$CLI" rtc-write > "$F/out" 2>&1 &
+pid=$!
+i=0; while [ ! -f "$F/delayed" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+kill -TERM "$pid" 2>/dev/null
+wait "$pid" 2>/dev/null; rc=$?
+unset WP_DELAY_REG
+assert_file_exists "$F/delayed" "TERM landed with the hour write in flight"
+assert_eq "143" "$rc" "exit 143"
+assert_eq "58 59 60 61 63 64 " "$(cut -d' ' -f4 "$F/log/i2cset" | tr '\n' ' ')" "all six fields were written, in order"
+assert_eq "0x08" "$(cat "$F/regs/63" 2>/dev/null)" "the month is on the board"
+assert_contains "$(cat "$F/out")" "all fields verified" "and verified"
+assert_contains "$(cat "$F/out")" "TERM received during the writes — finished them first (rc 0), exiting 143" "the signal is named after the fact"
+fixture_rm "$F"
+
+describe "configure under TERM: the register in hand is finished and verified, the rest waits, exit 143"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WP_DELAY_REG=21
+PATH="$F/bin:$PATH" WITTYPI_LIB="$LIB" WITTYPI_LOCK="$F/lock" WITTYPI_RUN_DIR="$F/run" \
+    INVOCATION_ID=test WITTYPI_TOPOLOGY=vin3s sh "$CLI" configure > "$F/out" 2>&1 &
+pid=$!
+i=0; while [ ! -f "$F/delayed" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+kill -TERM "$pid" 2>/dev/null
+wait "$pid" 2>/dev/null; rc=$?
+unset WP_DELAY_REG
+assert_file_exists "$F/delayed" "TERM landed with register 21's write in flight"
+assert_eq "143" "$rc" "exit 143"
+assert_eq "250" "$(reg_dec "$F" 21)" "register 21 reached the board"
+assert_contains "$(cat "$F/out")" "set   21" "and was verified"
+assert_file_absent "$F/regs/49" "register 49, later in the table, was not written"
+assert_contains "$(cat "$F/out")" "TERM received — register 21 finished and verified, the rest of the table left for the next run, exiting 143" "the stop is named"
+fixture_rm "$F"
+
+describe "a bare configure at a prompt refuses without --compiled-defaults; with it, or under the unit, it runs"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WITTYPI_INTERACTIVE=1 WITTYPI_TOPOLOGY=vin3s
+run_rpi_unit "$F" wittypi configure
+assert_eq "64" "$RUN_RC" "refused, exit 64"
+assert_contains "$RUN_OUT" 'REFUSING: a bare "wittypi configure" at a prompt applies COMPILED defaults' "and says why"
+assert_contains "$RUN_OUT" "systemctl restart wittypi-configure.service" "and what to run instead"
+assert_eq "" "$(stub_log "$F" i2cset)" "nothing written"
+run_rpi_unit "$F" wittypi configure --compiled-defaults
+assert_eq "0" "$RUN_RC" "--compiled-defaults: it runs"
+assert_eq "26" "$(reg_dec "$F" 49)" "and applies the compiled 26 h it was told about"
+unset WITTYPI_INTERACTIVE
+export INVOCATION_ID=test
+run_rpi_unit "$F" wittypi configure
+assert_eq "0" "$RUN_RC" "under the unit (INVOCATION_ID): it runs without the flag"
+unset INVOCATION_ID WITTYPI_TOPOLOGY
+fixture_rm "$F"
+
+describe "configure takes register 49 from the policy file over the environment"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+printf 'WITTYPI_GUARANTEED_WAKE=16\n' > "$F/policy.env"
+export INVOCATION_ID=test WITTYPI_TOPOLOGY=vin3s WITTYPI_GUARANTEED_WAKE=26
+run_rpi_unit "$F" wittypi configure
+assert_eq "0" "$RUN_RC" "applied"
+assert_eq "16" "$(reg_dec "$F" 49)" "register 49 is the policy file's 16, not the environment's 26"
+rm -f "$F/policy.env" "$F/regs/49"
+run_rpi_unit "$F" wittypi configure
+assert_eq "26" "$(reg_dec "$F" 49)" "without a policy file the environment's 26 applies"
+unset INVOCATION_ID WITTYPI_TOPOLOGY WITTYPI_GUARANTEED_WAKE
+fixture_rm "$F"

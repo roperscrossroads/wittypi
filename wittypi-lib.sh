@@ -836,9 +836,9 @@ wp_check_guaranteed_wake() {
 # not safety, and blurring that line would dilute the read-back that
 # matters.
 #
-# No lock is taken here — callers are expected to hold their own lock for
-# their whole run (e.g. a systemd unit's flock wrap), matching every other
-# writer that touches these registers.
+# No lock is taken here — callers hold their own exclusive lock for their
+# whole run (wp_lock x; or, for a script that has not yet moved in-script,
+# its unit's flock wrap), matching every other writer of these registers.
 wp_arm_alarm() {
     wp_aa_base=$1
     wp_aa_at=$2
