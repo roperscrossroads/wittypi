@@ -166,10 +166,14 @@ Any caller that arms or clears an alarm should implement both orderings.
 
 ### If the write is interrupted
 
-A well-behaved caller traps `TERM`/`INT` — e.g. a systemd stop timeout — and
-clears the day and seconds fields on the way out, so an interrupted arm
-leaves an unambiguous state instead of a plausible-looking one. A failed
-read-back should back the whole alarm out to zero for the same reason.
+A well-behaved caller traps `TERM`/`INT` — e.g. a systemd stop at shutdown —
+and FINISHES the arm before exiting: all four writes and the read-back, then
+exit 143. `wp_arm_alarm` does this. An earlier version cleared the day and
+seconds on the way out instead, which turned an ordinary unit stop into a
+node with no wake at all; a write already in flight completes anyway (the
+shell defers a trap while the child runs), and one arm takes about 1.2 s,
+which any stop timeout must cover. A failed read-back still backs the whole
+alarm out to zero, day first, so the state is never a plausible-looking half.
 
 ---
 

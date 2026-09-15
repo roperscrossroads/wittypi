@@ -68,9 +68,9 @@
 #
 # No lock taken in-script: the unit wraps ExecStart in flock -w 10 on
 # /run/wittypi.lock, the same boot-time class as wittypi-clock/-configure.
-# wp_arm_alarm's TERM trap therefore runs still holding the lock, and
-# wake-guard's ensure (1 s wait, gives up rather than blocks) can never race
-# a half-written appointment.
+# wp_arm_alarm finishes an alarm it has started even under TERM, still
+# holding that lock, so wake-guard's ensure (1 s wait, gives up rather than
+# blocks) can never see a half-written appointment.
 #
 # Overridable paths mirror the other ops tools' test seams; the shipped unit
 # runs the defaults.

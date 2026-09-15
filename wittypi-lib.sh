@@ -815,11 +815,16 @@ wp_check_guaranteed_wake() {
 #     (receiveEvent() clears I2C_ALARMx_TRIGGERED on any write inside the
 #     block) — so from that instant until the day lands the alarm is "live"
 #     with a partial value. Day-last is what makes that window safe.
-#   * A TERM/INT mid-write clears day THEN seconds rather than leaving a
-#     half-set state — day so nothing can match, seconds as belt to that
-#     braces (the one matchable midnight combination WITTYPI-ALARM1.md
-#     derives), then exits: systemd's stop is exactly how this dies, and
-#     the process was being killed anyway.
+#   * A TERM/INT mid-write is NOTED, and the sequence FINISHES — all four
+#     writes and the read-back — before the process exits 143. Until
+#     2026-09 the trap cleared day then seconds and exited at once, which
+#     turned an ordinary unit stop (systemd's TERM at shutdown, a stop
+#     timeout) into a node with NO wake: the one outcome this design exists
+#     to prevent (csramsh-nodes WITTYPI-ACCESS-AUDIT.md D8). A write in
+#     flight completes anyway (the shell defers a trap while i2cset runs),
+#     and the read-back with its day-first back-out below still guarantees
+#     "fully armed or fully cleared". One arm is ~1.2 s; a unit's stop
+#     timeout must cover it, because KILL cannot be waited out.
 #   * The write is READ BACK (wp_get_maybe_stable — alarm registers are
 #     stable-class) and backed out day-first on any mismatch. An unverified
 #     write here is a board that never wakes.
@@ -858,14 +863,15 @@ wp_arm_alarm() {
         return 1
     fi
 
-    trap 'wp_set "$wp_aa_day" 0; wp_set "$wp_aa_base" 0; wp_log "interrupted mid-write — register-$wp_aa_base alarm cleared rather than left half-set"; exit 1' TERM INT
+    # TERM/INT only set a flag here; wp_arm_alarm_done acts on it once the
+    # registers are in a state that is either fully armed or fully cleared.
+    wp_aa_term=0
+    trap 'wp_aa_term=1' TERM INT
 
     wp_set "$wp_aa_base" "0x$wp_aa_s"
     wp_set "$wp_aa_min"  "0x$wp_aa_m"
     wp_set "$wp_aa_hour" "0x$wp_aa_h"
     wp_set "$wp_aa_day"  "0x$wp_aa_d"
-
-    trap - TERM INT
 
     wp_aa_ok=1
     [ "$(wp_get_maybe_stable "$wp_aa_base")" = "$(( 0x$wp_aa_s ))" ] || wp_aa_ok=0
@@ -878,12 +884,28 @@ wp_arm_alarm() {
         wp_set "$wp_aa_min" 0
         wp_set "$wp_aa_base" 0
         wp_log_err "WROTE a register-$wp_aa_base alarm, the read-back did NOT match — cleared rather than trusted"
+        wp_arm_alarm_done 1
         return 1
     fi
 
     wp_set "$wp_aa_flag" 0
     wp_log "armed register-$wp_aa_base alarm for day $wp_aa_d at $wp_aa_h:$wp_aa_m:$wp_aa_s UTC$(wp_utc_note)"
+    wp_arm_alarm_done 0
     return 0
+}
+
+# wp_arm_alarm_done <rc> — the end of every wp_arm_alarm path: the default
+# TERM/INT disposition comes back, and if a signal arrived during the arm the
+# process exits 143 NOW, with the registers settled and the arm's outcome
+# logged. A stop that was asked for is honoured — after the one thing that
+# must not be left half done. Returns <rc> when no signal arrived.
+wp_arm_alarm_done() {
+    trap - TERM INT
+    if [ "${wp_aa_term:-0}" = 1 ]; then
+        wp_log "TERM received while writing the register-$wp_aa_base alarm — finished it first (rc $1), exiting 143"
+        exit 143
+    fi
+    return "$1"
 }
 
 # ── The board-calibration registry ──────────────────────────────────────────

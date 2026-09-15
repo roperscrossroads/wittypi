@@ -8,12 +8,14 @@
 # silently does not take, WP_BLOCK_REG one that hangs mid-sequence. date is
 # REAL: the anchor under test is the stubbed RTC, not the host clock.
 #
-# The SIGTERM case is written from scratch — the wake-guard trap it mirrors
-# was proven by hand against a stalling controller and never committed as a
-# test. Mechanics: the first write to the HOUR register blocks; the script
-# is TERMed (the shell defers the trap while a foreground child runs), then
-# the blocked i2cset is killed, which lets the trap fire against a free
-# stub. What must remain: day AND seconds zeroed, alarm2 never touched.
+# The SIGTERM cases: wp_arm_alarm FINISHES an alarm under TERM and then exits
+# 143. Mechanics: a write to the HOUR register is delayed (WP_DELAY_REG) or
+# blocked (WP_BLOCK_REG); the script is TERMed while that child runs (the
+# shell defers the trap until it exits). Delayed: the write lands, the
+# sequence completes, the alarm is armed and verified, exit 143. Blocked and
+# then killed: the read-back sees the missing write and backs the alarm out
+# day-first, exit 143. Either way alarm2 is never touched and nothing is
+# left half-set — and nothing is cleared merely because a stop arrived.
 #
 # Every refusal case asserts the same two things: the named reason, and an
 # EMPTY i2cset log — a scheduler that refuses after writing something has
@@ -49,6 +51,10 @@ stub_sched_i2c() {
         printf 'if [ "$4" = "${WP_BLOCK_REG:-none}" ] && [ ! -f "%s/blocked" ]; then\n' "$1"
         printf '    : > "%s/blocked"\n' "$1"
         printf '    sleep 30\n'
+        printf 'fi\n'
+        printf 'if [ "$4" = "${WP_DELAY_REG:-none}" ] && [ ! -f "%s/delayed" ]; then\n' "$1"
+        printf '    : > "%s/delayed"\n' "$1"
+        printf '    sleep 1\n'
         printf 'fi\n'
         printf '[ "$4" = "${WP_DROP_REG:-none}" ] && exit 0\n'
         printf 'printf "%%s\\n" "$5" > "%s/regs/$4"\n' "$1"
@@ -459,28 +465,53 @@ assert_contains "$RUN_OUT" 'not self-stop' "the benign direction is stated"
 assert_contains "$(stub_log "$F" notify)" 'not the shutdown' "and paged"
 fixture_rm "$F"
 
-describe "SIGTERM mid-write: the trap clears day AND seconds, and alarm2 is never reached"
+# Start the scheduler in the background; $1 = fixture. Sets sched_pid.
+sched_bg() {
+    PATH="$1/bin:$PATH" \
+        WITTYPI_SCHEDULE_LIB="$LIB" \
+        WITTYPI_SCHEDULE_ENV="$1/data/wittypi-schedule.env" \
+        WITTYPI_SCHEDULE_TERMS="$1/terms" \
+        WITTYPI_SCHEDULE_NOTIFY="$1/bin/notify" \
+        sh "$SCHED" >"$1/out" 2>&1 &
+    sched_pid=$!
+}
+wait_for() { i=0; while [ ! -f "$1" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i+1)); done; }
+
+describe "SIGTERM mid-write: the write in flight lands, the alarm is finished and verified, THEN exit 143"
+F=$(sched_fixture)
+export WP_DELAY_REG=29
+sched_bg "$F"
+wait_for "$F/delayed"
+kill -TERM "$sched_pid" 2>/dev/null
+wait "$sched_pid" 2>/dev/null; sched_rc=$?
+unset WP_DELAY_REG
+assert_file_exists "$F/delayed" "TERM arrived with the hour register's write in flight"
+assert_eq "143" "$sched_rc" "exit 143: the stop was honoured, after the arm"
+assert_eq "27 28 29 30 39 " "$(set_seq "$F")" "seconds, minutes, hour, day, then the flag — the whole alarm1 sequence, and never register 32"
+assert_eq "0x13" "$(cat "$F/regs/30" 2>/dev/null)" "alarm1's day is armed — the node WILL wake"
+assert_contains "$(cat "$F/out" 2>/dev/null)" 'armed register-27 alarm' "the arm is logged as complete"
+assert_contains "$(cat "$F/out" 2>/dev/null)" 'TERM received while writing the register-27 alarm — finished it first (rc 0), exiting 143' "and the signal is named, after the fact"
+assert_not_contains "$(cat "$F/out" 2>/dev/null)" 'cleared' "nothing was cleared because a stop arrived"
+fixture_rm "$F"
+
+describe "SIGTERM with the write in flight KILLED: the read-back catches it, backs out day-first, exit 143"
 F=$(sched_fixture)
 export WP_BLOCK_REG=29
-PATH="$F/bin:$PATH" \
-    WITTYPI_SCHEDULE_LIB="$LIB" \
-    WITTYPI_SCHEDULE_ENV="$F/data/wittypi-schedule.env" \
-    WITTYPI_SCHEDULE_TERMS="$F/terms" \
-    WITTYPI_SCHEDULE_NOTIFY="$F/bin/notify" \
-    sh "$SCHED" >"$F/out" 2>&1 &
-sched_pid=$!
-i=0
-while [ ! -f "$F/blocked" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i+1)); done
-# TERM the script first (the shell defers the trap while its foreground
-# child runs), then kill the blocked i2cset so the trap can fire.
+sched_bg "$F"
+wait_for "$F/blocked"
+# TERM the script (deferred while its child runs), then kill the blocked
+# i2cset: the hour write is lost, the sequence continues to the read-back.
 kill -TERM "$sched_pid" 2>/dev/null
 pkill -TERM -f "$F/bin/i2cset" 2>/dev/null || true
-wait "$sched_pid" 2>/dev/null
+wait "$sched_pid" 2>/dev/null; sched_rc=$?
 unset WP_BLOCK_REG
-assert_file_exists "$F/blocked" "the sequence really was interrupted mid-write (hour register in flight)"
-assert_contains "$(cat "$F/out" 2>/dev/null)" 'interrupted mid-write' "the trap says what it did"
+assert_file_exists "$F/blocked" "the hour register's write was in flight"
+assert_eq "143" "$sched_rc" "exit 143"
+assert_eq "27 28 29 30 30 29 28 27 " "$(set_seq "$F")" "the day is still written, the read-back fails on the lost hour, and the back-out runs day-first"
 assert_eq "0" "$(cat "$F/regs/30" 2>/dev/null)" "day zeroed — nothing can match"
 assert_eq "0" "$(cat "$F/regs/27" 2>/dev/null)" "seconds zeroed too — the midnight-combination brace"
+assert_contains "$(cat "$F/out" 2>/dev/null)" 'read-back did NOT match' "it is the read-back that decided, not the signal"
+assert_contains "$(cat "$F/out" 2>/dev/null)" 'finished it first (rc 1), exiting 143' "then the stop was honoured"
 assert_not_contains "$(set_seq "$F")" "32" "alarm2 was never reached"
 fixture_rm "$F"
 
