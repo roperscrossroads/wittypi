@@ -540,7 +540,18 @@ rtc-sync)
     # RTC -> system. This is the board's only source of time before the
     # network is up: there is no /dev/rtc for systemd to use, so nothing does
     # this automatically.
-    wp_require
+    #
+    # ⚠️ WAITS FOR THE CONTROLLER, BOUNDED, WHEN ITS UNIT ASKS. On 2026-09-15
+    # this ran first on the bus at ~28 s of boot and found no controller in 7
+    # of 10 boots; wittypi-configure found it ~2 s later, and 400 steady-state
+    # reads were all clean. So the unit sets WITTYPI_PROBE_SEC and this retries
+    # once a second, logging the real i2cget error of the first miss. A human
+    # at a prompt gets one attempt, as before.
+    wp_wait_present "${WITTYPI_PROBE_SEC:-0}" || {
+        printf 'no Witty Pi at %s on i2c-%s.\n' "$WP_ADDR" "$WP_BUS" >&2
+        printf 'Check it is fitted, and that i2cdetect -y %s shows 0x08.\n' "$WP_BUS" >&2
+        exit 1
+    }
     # ── Name the cause that actually happened ──────────────────────────────
     # A version of this used to say "it has lost power" for EVERY failure,
     # including when the real fault was a torn read (wp_rtc_read straddling

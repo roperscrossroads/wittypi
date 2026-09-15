@@ -705,6 +705,66 @@ wp_present() {
     [ "$wp_present_id" = "38" ]   # 0x26
 }
 
+# wp_probe_cause — one line saying WHY the controller did not answer, for a
+# log. wp_get sends i2cget's stderr to /dev/null, which is right for the
+# glitch-tolerant reads but leaves a failed presence check undiagnosable: on
+# 2026-09-15 wittypi-clock logged "no Witty Pi" in 7 of 10 boots and nothing
+# said whether that was a missing adapter, a NAK, a bus timeout or a wrong
+# id. This does one extra read with stderr kept. Never decides anything.
+wp_probe_cause() {
+    wp_pc_dev="${WITTYPI_I2C_DEV:-/dev/i2c-$WP_BUS}"
+    if [ ! -e "$wp_pc_dev" ]; then
+        printf '%s does not exist' "$wp_pc_dev"
+        return 0
+    fi
+    wp_pc_out=$(i2cget -y "$WP_BUS" "$WP_ADDR" "$WP_REG_ID" 2>&1)
+    wp_pc_rc=$?
+    wp_pc_out=$(printf '%s' "$wp_pc_out" | tr '\n' ' ' | sed 's/ *$//')
+    if [ "$wp_pc_rc" -ne 0 ]; then
+        printf 'i2cget failed (rc %s): %s' "$wp_pc_rc" "${wp_pc_out:-no message}"
+    elif [ "$wp_pc_out" != "0x26" ]; then
+        printf 'id register reads %s, expected 0x26' "${wp_pc_out:-nothing}"
+    else
+        printf 'one read now answers 0x26: the two-read check failed transiently'
+    fi
+    return 0
+}
+
+# wp_wait_present <seconds> — wp_present, retried once a second.
+#
+# <seconds> 0 (or unset, or not a number) is a single attempt: the CLI's
+# behaviour for a human at a prompt, where "no Witty Pi" should be instant.
+# A unit that runs early in boot passes a bound instead: nothing at boot is on
+# the controller's 25 s power-cut clock, so waiting a few seconds costs one
+# boot a few seconds and buys a clock that is actually set.
+#
+# Logs the cause of the FIRST miss (wp_probe_cause), and, if the controller
+# then answers, on which attempt; if it never does, logs both the first and the
+# last cause at ERR, so journal-persist keeps it. Sleeps between attempts only.
+wp_wait_present() {
+    wp_wp_max=${1:-0}
+    case "$wp_wp_max" in ''|*[!0-9]*) wp_wp_max=0 ;; esac
+    wp_wp_n=0
+    wp_wp_first=""
+    while :; do
+        wp_wp_n=$(( wp_wp_n + 1 ))
+        if wp_present; then
+            [ -n "$wp_wp_first" ] && \
+                wp_log "controller answered on attempt $wp_wp_n (after about $(( wp_wp_n - 1 ))s); first miss: $wp_wp_first"
+            return 0
+        fi
+        if [ -z "$wp_wp_first" ]; then
+            wp_wp_first=$(wp_probe_cause)
+            [ "$wp_wp_max" -gt 0 ] && \
+                wp_log "controller did not answer on attempt 1: $wp_wp_first — retrying for up to ${wp_wp_max}s"
+        fi
+        [ "$wp_wp_n" -gt "$wp_wp_max" ] && break
+        sleep 1
+    done
+    wp_log_err "no controller after $wp_wp_n attempt(s); first miss: $wp_wp_first; last: $(wp_probe_cause)"
+    return 1
+}
+
 # Does this board's firmware implement guaranteed wake (WITTYPI.md layer 3)?
 wp_has_guaranteed_wake() {
     wp_hgw_rev=$(wp_get "$WP_REG_FW_REVISION") || return 1
