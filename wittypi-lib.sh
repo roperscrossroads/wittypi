@@ -1268,3 +1268,241 @@ wp_gpiochip() {
 wp_halt_level() {
     gpioget --numeric -b pull-up -c "$1" "$WP_HALT_PIN" 2>/dev/null | sed 's/.*=//'
 }
+
+# ═══ The lock, the halt marker, and config files read without executing them ═
+# Added for the shutdown rework (csramsh-nodes WITTYPI-ACCESS-AUDIT.md §H).
+# Scripts move onto these one at a time, each in the same commit that drops
+# its unit's `flock` wrapper — a wrapper plus an in-script lock would wait on
+# itself. Until a script has moved, nothing here changes its behaviour.
+
+# ── Exit codes ─────────────────────────────────────────────────────────────
+# 75 (EX_TEMPFAIL): the I2C lock could not be taken within the wait. NEVER in
+#    any unit's SuccessExitStatus= — a run that skipped its work must show.
+# 69 (EX_UNAVAILABLE): a write stood down because a halt is under way. Listed
+#    as success only on the units that are meant to stand down.
+WP_EX_LOCK=75
+WP_EX_STANDDOWN=69
+
+# ── The lock ───────────────────────────────────────────────────────────────
+# One file, /run/wittypi.lock, always on fd 9, opened for APPEND (so a holder
+# can never truncate it) and never deleted (a recreated file is a second lock
+# that nobody else shares).
+#
+#   shared (s)     multi-register reads, and read-then-decide steps
+#   exclusive (x)  any sequence that writes
+#   no lock        one register read or write: i2c-dev already takes the
+#                  adapter lock per transfer
+#
+# ⚠️ NESTING. A flock(2) lock belongs to the OPEN FILE DESCRIPTION, and a
+# child inherits its parent's fd 9. If the child ran `flock -x 9` on that
+# inherited fd it would CONVERT the parent's lock — or, with -u, RELEASE it —
+# rather than queue behind it. So wp_lock locks only when this process does
+# not already hold the lock by inheritance. Two things must both be true for
+# that: WITTYPI_LOCK_HELD (exported by the holder) names the mode held, AND
+# fd 9 really is the lock file (readlink on /proc/self/fd/9) — the variable
+# alone can be stale, in a child started with `9>&-` or through systemctl.
+#
+#   s under x, s under s, x under x   already covered: return 0, lock nothing
+#   x under s                         refused with 75 — an upgrade would
+#                                     replace the caller's lock
+#
+# Children that touch no I2C (notify, curl) run with `9>&-`, or a lingering
+# child keeps the lock held after the caller has exited.
+WP_LOCK="${WITTYPI_LOCK:-/run/wittypi.lock}"
+
+# The one test for "fd 9 is our lock file". readlink runs as a child, but it
+# inherits fd 9 unchanged, so its own /proc/self/fd/9 is the same file.
+wp_lock_fd_is_lock() {
+    wp_lf_have=$(readlink /proc/self/fd/9 2>/dev/null) || return 1
+    [ -n "$wp_lf_have" ] || return 1
+    [ "$wp_lf_have" = "$(readlink -f "$WP_LOCK" 2>/dev/null)" ]
+}
+
+# wp_lock s|x <wait-seconds> <who>
+#   0   held — taken now, or already held by an ancestor
+#   75  not taken within the wait, or x asked for under an inherited s;
+#       logged at err naming <who>; fd 9 is closed again
+#   2   usage
+# <who> is for the log line ("wittypi-schedule", "wake-guard keep"): on a
+# lock timeout the journal must say which caller gave up, not just that one did.
+wp_lock() {
+    wp_lk_mode=${1:-}
+    wp_lk_wait=${2:-}
+    wp_lk_who=${3:-wittypi}
+    case "$wp_lk_mode" in
+        s) wp_lk_flag=-s ;;
+        x) wp_lk_flag=-x ;;
+        *) wp_log_err "wp_lock: mode '$wp_lk_mode' is neither s nor x"; return 2 ;;
+    esac
+    case "$wp_lk_wait" in
+        ''|*[!0-9]*) wp_log_err "wp_lock: wait '$wp_lk_wait' is not a whole number of seconds"; return 2 ;;
+    esac
+    if [ -n "${WITTYPI_LOCK_HELD:-}" ] && wp_lock_fd_is_lock; then
+        case "${WITTYPI_LOCK_HELD}:${wp_lk_mode}" in
+            x:*|s:s) return 0 ;;
+            *) wp_log_err "$wp_lk_who: needs the I2C lock exclusive but inherits it shared — refusing rather than replace the caller's lock"
+               return "$WP_EX_LOCK" ;;
+        esac
+    fi
+    # A failed redirection on `exec` ends a non-interactive shell outright,
+    # so prove the open works in a subshell before doing it for real.
+    if ! ( exec 9>>"$WP_LOCK" ) 2>/dev/null; then
+        wp_log_err "$wp_lk_who: cannot open the I2C lock $WP_LOCK"
+        return "$WP_EX_LOCK"
+    fi
+    exec 9>>"$WP_LOCK"
+    if flock "$wp_lk_flag" -w "$wp_lk_wait" 9; then
+        WITTYPI_LOCK_HELD=$wp_lk_mode
+        export WITTYPI_LOCK_HELD
+        WP_LOCK_OWNED=1
+        return 0
+    fi
+    exec 9>&-
+    wp_log_err "$wp_lk_who: could not get the I2C lock ($wp_lk_mode) within ${wp_lk_wait}s"
+    return "$WP_EX_LOCK"
+}
+
+# wp_unlock — release the lock THIS process took, by closing fd 9. Never
+# `flock -u`: on an inherited fd that would release the ancestor's lock too.
+# A lock held by inheritance is the ancestor's to release; this does nothing.
+wp_unlock() {
+    [ -n "${WP_LOCK_OWNED:-}" ] || return 0
+    exec 9>&-
+    unset WP_LOCK_OWNED WITTYPI_LOCK_HELD
+    return 0
+}
+
+# ── The halt marker ────────────────────────────────────────────────────────
+# /run/wittypi/halt-requested means "a power-off is under way — up-time
+# actors stand down". The daemon writes it the moment the controller asks
+# (before anything else), the shutdown gate writes it for an immediate
+# power-off; `wittypi halt-status` (an ExecCondition: no I2C, no lock) and the
+# scripts at their risky points read it.
+#
+# One key=value per line: source, uptime (whole seconds from /proc/uptime),
+# reason, state, a1, a2. Written to a temporary file and renamed, so a reader
+# never sees half a marker. STALE after 120 s of uptime: a marker left by a
+# cancelled shutdown must not silence the up-time actors for the rest of the
+# boot, and /run is cleared at boot, so it cannot outlive one.
+WP_RUN_DIR="${WITTYPI_RUN_DIR:-/run/wittypi}"
+WP_HALT_MARKER="$WP_RUN_DIR/halt-requested"
+WP_HALT_STALE_SEC=120
+WP_UPTIME_FILE="${WITTYPI_UPTIME:-/proc/uptime}"
+
+# wp_uptime — whole seconds since boot; nothing and return 1 if unreadable.
+wp_uptime() {
+    wp_up=$(cut -d' ' -f1 "$WP_UPTIME_FILE" 2>/dev/null)
+    wp_up=${wp_up%%.*}
+    case "$wp_up" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$wp_up"
+}
+
+# wp_halt_write <source> <reason> [state] [a1] [a2] — write the marker,
+# atomically. Returns 1 if the run directory cannot be made or written.
+wp_halt_write() {
+    wp_hw_up=$(wp_uptime) || wp_hw_up=0
+    mkdir -p "$WP_RUN_DIR" 2>/dev/null || return 1
+    {
+        printf 'source=%s\n' "${1:-}"
+        printf 'uptime=%s\n' "$wp_hw_up"
+        printf 'reason=%s\n' "${2:-}"
+        printf 'state=%s\n' "${3:-}"
+        printf 'a1=%s\n' "${4:-}"
+        printf 'a2=%s\n' "${5:-}"
+    } > "$WP_HALT_MARKER.tmp.$$" 2>/dev/null || { rm -f "$WP_HALT_MARKER.tmp.$$"; return 1; }
+    mv -f "$WP_HALT_MARKER.tmp.$$" "$WP_HALT_MARKER"
+}
+
+# wp_halt_update <key> <value> — rewrite one key of an existing marker
+# (state=armed once the pre-arm is done), atomically. 1 if there is none.
+wp_halt_update() {
+    [ -f "$WP_HALT_MARKER" ] || return 1
+    { grep -v "^${1}=" "$WP_HALT_MARKER"; printf '%s=%s\n' "$1" "${2:-}"; } \
+        > "$WP_HALT_MARKER.tmp.$$" 2>/dev/null || { rm -f "$WP_HALT_MARKER.tmp.$$"; return 1; }
+    mv -f "$WP_HALT_MARKER.tmp.$$" "$WP_HALT_MARKER"
+}
+
+# wp_halt_read — print the marker when a halt is requested and the marker is
+# fresh. Return 1, silently, when there is none; a STALE marker is deleted,
+# logged, and also 1. Uses no I2C and takes no lock.
+wp_halt_read() {
+    [ -f "$WP_HALT_MARKER" ] || return 1
+    wp_hr_at=$(sed -n 's/^uptime=//p' "$WP_HALT_MARKER" | sed -n 1p)
+    wp_hr_now=$(wp_uptime) || wp_hr_now=""
+    wp_hr_stale=0
+    case "$wp_hr_at" in ''|*[!0-9]*) wp_hr_stale=1 ;; esac      # unreadable stamp
+    if [ "$wp_hr_stale" = 0 ] && [ -n "$wp_hr_now" ]; then
+        if [ "$wp_hr_now" -lt "$wp_hr_at" ] || [ $(( wp_hr_now - wp_hr_at )) -gt "$WP_HALT_STALE_SEC" ]; then
+            wp_hr_stale=1
+        fi
+    fi
+    if [ "$wp_hr_stale" = 1 ]; then
+        wp_log "halt marker from uptime ${wp_hr_at:-?}s is stale at ${wp_hr_now:-?}s — removing it"
+        rm -f "$WP_HALT_MARKER"
+        return 1
+    fi
+    cat "$WP_HALT_MARKER"
+}
+
+# wp_halt_requested — true (0) when a fresh marker exists; prints nothing.
+wp_halt_requested() { wp_halt_read >/dev/null; }
+
+# wp_halt_clear — remove the marker (the gate does this when its power-off
+# command fails, so a node that stays up is not left standing down).
+wp_halt_clear() { rm -f "$WP_HALT_MARKER"; }
+
+# ── Reading a config file without executing it ────────────────────────────
+# wp_env_val <file> <WITTYPI_NAME> — NAME's value in <file>, as systemd's
+# EnvironmentFile= would deliver it: the LAST assignment wins, one matching
+# pair of quotes is stripped, and nothing in the file is ever run. Prints
+# nothing and returns 1 when the file is unreadable or has no such line, 2
+# for a name that is not WITTYPI_*: this reads site and policy files, which
+# carry nothing else, and a config file must never be able to name PATH.
+#
+# (wp_utc_note and wittypi-audit grep the FIRST match of their one variable.
+# Files with a repeated line are the only case where that differs; folding
+# them onto this helper is part of the configuration consolidation, later.)
+wp_env_val() {
+    case "${2:-}" in
+        WITTYPI_[A-Z0-9_]*) case "$2" in *[!A-Z0-9_]*) return 2 ;; esac ;;
+        *) return 2 ;;
+    esac
+    [ -r "${1:-}" ] || return 1
+    wp_ev=$(sed -n "s/^$2=//p" "$1" | sed -n '$p')
+    [ -n "$wp_ev" ] || return 1
+    case "$wp_ev" in
+        \"*\") wp_ev=${wp_ev#\"}; wp_ev=${wp_ev%\"} ;;
+        \'*\') wp_ev=${wp_ev#\'}; wp_ev=${wp_ev%\'} ;;
+    esac
+    printf '%s' "$wp_ev"
+}
+
+# ── Register 49's effective value ──────────────────────────────────────────
+# wake-policy (the integration layer) derives the guaranteed-wake hours from
+# the active schedule and writes ONE file, /run/wittypi/policy.env, holding
+# WITTYPI_GUARANTEED_WAKE=<hours>. It floors the site's value, so it must win
+# over the site's own line. Precedence, highest first:
+#
+#   /run/wittypi/policy.env     derived from the schedule (WITTYPI_POLICY_ENV
+#                               points a bench elsewhere, /dev/null to ignore)
+#   the environment             the unit's EnvironmentFile=, or a typed override
+#   /data/wittypi.env           the site's stated value, grepped
+#   nothing (return 1)          the caller applies its compiled default
+#
+# wp_guaranteed_wake_policy prints "<hours><TAB><source>", source being
+# policy, env or site — the audit and the keeper say where a value came from,
+# because a drift verdict without its source sends a human to the wrong file.
+WP_POLICY_ENV="${WITTYPI_POLICY_ENV:-$WP_RUN_DIR/policy.env}"
+
+wp_guaranteed_wake_policy() {
+    if wp_gwp=$(wp_env_val "$WP_POLICY_ENV" WITTYPI_GUARANTEED_WAKE); then
+        printf '%s\tpolicy' "$wp_gwp"; return 0
+    fi
+    if [ -n "${WITTYPI_GUARANTEED_WAKE:-}" ]; then
+        printf '%s\tenv' "$WITTYPI_GUARANTEED_WAKE"; return 0
+    fi
+    if wp_gwp=$(wp_env_val "$WP_SITE_ENV" WITTYPI_GUARANTEED_WAKE); then
+        printf '%s\tsite' "$wp_gwp"; return 0
+    fi
+    return 1
+}
