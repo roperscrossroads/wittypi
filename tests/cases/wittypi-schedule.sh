@@ -108,6 +108,8 @@ run_sched() {
         WITTYPI_SITE_ENV="$_f/data/wittypi.env" \
         WITTYPI_SCHEDULE_NOTIFY="$_f/bin/notify" \
         PROC_UPTIME="$_f/proc/uptime" \
+        WITTYPI_LOCK="$_f/lock" \
+        WITTYPI_RUN_DIR="$_f/run" \
         sh "$SCHED" "$@" 2>&1
     )
     RUN_RC=$?
@@ -472,6 +474,7 @@ sched_bg() {
         WITTYPI_SCHEDULE_ENV="$1/data/wittypi-schedule.env" \
         WITTYPI_SCHEDULE_TERMS="$1/terms" \
         WITTYPI_SCHEDULE_NOTIFY="$1/bin/notify" \
+        WITTYPI_LOCK="$1/lock" WITTYPI_RUN_DIR="$1/run" \
         sh "$SCHED" >"$1/out" 2>&1 &
     sched_pid=$!
 }
@@ -522,7 +525,16 @@ sched_body=$(grep -v '^\s*#' "$SCHED")
 assert_contains "$sched_body" 'wp_rtc_read_confirmed' "the anchor is the controller's own clock"
 assert_not_contains "$sched_body" 'date -u +%s' "never a bare Linux now"
 assert_not_contains "$sched_body" 'i2cset' "registers only through the lib"
-assert_not_contains "$sched_body" 'flock' "the lock is the unit's job, so the trap runs under it"
+assert_not_contains "$sched_body" 'flock' "never flock directly — the lib's wp_lock is the one lock"
+assert_eq "1" "$(printf '%s\n' "$sched_body" | grep -c 'wp_lock x ')" "takes the lock itself, exclusive, once"
+probe_ln=$(printf '%s\n' "$sched_body" | grep -n 'while ! wp_present' | cut -d: -f1 | head -n 1)
+lock_ln=$(printf '%s\n' "$sched_body" | grep -n 'wp_lock x ' | cut -d: -f1 | head -n 1)
+gw_ln=$(printf '%s\n' "$sched_body" | grep -n 'wp_get_stable "$WP_REG_GUARANTEED_WAKE"' | cut -d: -f1 | head -n 1)
+if [ -n "$probe_ln" ] && [ -n "$lock_ln" ] && [ -n "$gw_ln" ] && [ "$probe_ln" -lt "$lock_ln" ] && [ "$lock_ln" -lt "$gw_ln" ]; then
+    ok "probe ($probe_ln), then the lock ($lock_ln), then the first multi-register read ($gw_ln)"
+else
+    notok "probe before lock before the first multi-register read" "probe=$probe_ln lock=$lock_ln read=$gw_ln"
+fi
 assert_contains "$sched_body" 'wp_arm_alarm "$WP_REG_ALARM1_SEC"' "arms through the shared function, alarm1 by name"
 
 describe "the scheduler's defaults are the production paths"
@@ -557,7 +569,13 @@ assert_contains "$unit_text" 'Type=oneshot' "a boot oneshot"
 assert_contains "$unit_text" 'RemainAfterExit=yes' "the verdict stays visible in systemctl status"
 assert_contains "$unit_text" 'TimeoutStartSec=60' "the run is bounded — 60s since the probe retry can add 10s on a cold controller"
 assert_contains "$unit_text" 'TimeoutStopSec=5' "and the trap-only stop too"
-assert_contains "$unit_text" 'ExecStart=/usr/bin/flock -w 10 /run/wittypi.lock /usr/libexec/site/wittypi-schedule' "lock-wrapped like every boot-time writer"
+assert_contains "$unit_text" 'ExecStart=/usr/libexec/site/wittypi-schedule' "the bare script: it takes the lock itself"
+assert_not_contains "$unit_text" 'flock' "no wrapper — a wrapper plus the in-script lock would wait on itself"
+assert_contains "$unit_text" 'ExecCondition=/usr/bin/wittypi halt-status' "stands down while a power-off is under way"
+assert_not_contains "$unit_text" 'SuccessExitStatus' "no success statuses: a lock timeout (75) or a refusal must show"
+assert_contains "$unit_text" 'After=wittypi-rtc-save.service' "queued behind a queued RTC write, so a repair never arms from the uncorrected RTC"
+resched_text=$(grep -v '^#' "$RESCHED_UNIT")
+assert_contains "$resched_text" 'ExecCondition=/usr/bin/wittypi halt-status' "the reschedule wrapper stands down too"
 assert_not_contains "$unit_text" 'EnvironmentFile' "the script sources its own config — a typed run must behave identically"
 assert_contains "$unit_text" 'WantedBy=multi-user.target' "enabled"
 
@@ -776,3 +794,52 @@ run_sched "$F"
 assert_contains "$RUN_OUT" 'UTC (ET:-4/-5)' "rendered unquoted"
 assert_not_contains "$RUN_OUT" '("ET' "the quotes did not survive into the output"
 fixture_rm "$F"
+
+# ── the lock, on the real script ────────────────────────────────────────────
+
+describe "a held exclusive lock: 75, nothing written, logged at err naming the scheduler"
+if command -v flock >/dev/null 2>&1; then
+F=$(sched_fixture); : > "$F/lock"
+flock -x "$F/lock" sleep 6 & HOLDER=$!
+sleep 0.3
+export WITTYPI_LOCK_WAIT=0 INVOCATION_ID=x
+run_sched "$F"
+unset WITTYPI_LOCK_WAIT INVOCATION_ID
+assert_eq "75" "$RUN_RC" "exit 75"
+assert_contains "$RUN_OUT" "<3>wittypi: wittypi-schedule: could not get the I2C lock (x) within 0s" "the err line"
+assert_eq "" "$(set_seq "$F")" "nothing written"
+assert_eq "" "$(stub_log "$F" notify)" "and nobody paged: the next tick or the keeper retries"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+fixture_rm "$F"
+else printf '    SKIP flock not on this host\n'; fi
+
+describe "the probe runs before the lock: an opted-in node with no controller never waits on a held lock"
+if command -v flock >/dev/null 2>&1; then
+F=$(sched_fixture); : > "$F/lock"; rm -f "$F/regs/0"
+flock -x "$F/lock" sleep 8 & HOLDER=$!
+sleep 0.3
+export WITTYPI_SCHEDULE_PROBE_TRIES=2 WITTYPI_LOCK_WAIT=5
+t0=$(date +%s); run_sched "$F"; t1=$(date +%s)
+unset WITTYPI_SCHEDULE_PROBE_TRIES WITTYPI_LOCK_WAIT
+assert_eq "2" "$RUN_RC" "exit 2: opted in, no controller"
+assert_contains "$RUN_OUT" "did not answer in 2 probes" "the probe verdict"
+assert_not_contains "$RUN_OUT" "could not get the I2C lock" "the lock was never asked for"
+if [ $(( t1 - t0 )) -le 3 ]; then ok "and it did not sit out the 5 s lock wait"; else notok "no lock wait without a controller" "took $(( t1 - t0 ))s"; fi
+assert_contains "$(stub_log "$F" notify)" "controller did not answer" "paged, as before"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+fixture_rm "$F"
+else printf '    SKIP flock not on this host\n'; fi
+
+describe "the page goes out AFTER the lock is released — notify talks to the network, the bus does not wait for it"
+if command -v flock >/dev/null 2>&1; then
+F=$(sched_fixture)
+# A notify that records whether the lock was free when it ran.
+printf '#!/bin/sh\nif flock -n "%s/lock" true 2>/dev/null; then echo FREE; else echo HELD; fi >> "%s/log/lockstate"\nexit 0\n' "$F" "$F" > "$F/bin/notify"
+chmod +x "$F/bin/notify"
+export WP_DROP_REG=30
+run_sched "$F"
+unset WP_DROP_REG
+assert_eq "1" "$RUN_RC" "the arm failed (alarm1's day did not take)"
+assert_eq "FREE" "$(cat "$F/log/lockstate" 2>/dev/null)" "notify ran with the lock already released"
+fixture_rm "$F"
+else printf '    SKIP flock not on this host\n'; fi

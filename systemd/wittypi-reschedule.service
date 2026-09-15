@@ -21,6 +21,11 @@ Conflicts=shutdown.target
 [Service]
 Type=oneshot
 
+# Stand down while a power-off is under way, like the scheduler it restarts:
+# a config change that lands as the rail is about to go must not re-arm the
+# stop the shutdown path is acting on. No I2C, no lock; exit 1 is a skip.
+ExecCondition=/usr/bin/wittypi halt-status
+
 # No RemainAfterExit — that is the entire point of this file. A test pins it
 # absent, because adding it would silently reintroduce the one-shot-forever
 # bug this wrapper exists to avoid.
@@ -36,7 +41,7 @@ Type=oneshot
 # the scheduler's full 60 s.
 ExecStart=/usr/bin/systemctl restart wittypi-schedule.service
 
-# The scheduler allows itself 60 s (flock wait + controller probe + RTC
+# The scheduler allows itself 60 s (controller probe + lock wait + RTC
 # retries + arming); waiting on it needs at least as long, plus slack.
 TimeoutStartSec=75
 

@@ -31,16 +31,16 @@ do
     assert_not_contains "$body" "flock" "$unit carries no flock (a wrapper plus the in-script lock would wait on itself)"
 done
 
-describe "the scheduler still runs under its unit's wrapper — until its script takes the lock itself"
-# wittypi-schedule takes no lock in-script yet; its wrapper is what keeps
-# wp_arm_alarm's writes serialised. The commit that moves the lock into the
-# script removes the wrapper in the same change, and flips this assertion.
+describe "the scheduler, the fourth unit and the first writer among them, runs bare and locks in-script"
 if have "${RPI_SYSTEMD_DIR:-}/wittypi-schedule.service" "wittypi-schedule.service"; then
-assert_contains "$(unit_body wittypi-schedule.service)" \
-    "ExecStart=/usr/bin/flock -w 10 /run/wittypi.lock /usr/libexec/site/wittypi-schedule" \
-    "wittypi-schedule.service's ExecStart is still wrapped in the shared lock"
-assert_not_contains "$(grep -v '^[[:space:]]*#' "$OPS_UNITS_DIR/wittypi-schedule")" "wp_lock" \
-    "and the script takes none of its own (both at once would deadlock)"
+body=$(unit_body wittypi-schedule.service)
+assert_contains "$body" "ExecStart=/usr/libexec/site/wittypi-schedule" "wittypi-schedule.service's ExecStart is the bare script"
+assert_not_contains "$body" "flock" "no wrapper (a wrapper plus the in-script lock would wait on itself)"
+assert_contains "$(grep -v '^[[:space:]]*#' "$OPS_UNITS_DIR/wittypi-schedule")" "wp_lock x " \
+    "and the script takes the lock itself, exclusive"
+for n in wittypi-schedule.service wittypi-reschedule.service; do
+    assert_contains "$(unit_body $n)" "ExecCondition=/usr/bin/wittypi halt-status" "$n stands down while a power-off is under way"
+done
 fi
 
 describe "a lock timeout (75) is a success status on NO unit; a stand-down (69) only where the tool cannot be conditioned"

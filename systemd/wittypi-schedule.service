@@ -27,25 +27,34 @@ After=data.mount
 # schedule unit — the vendor's own script spins forever on a 1970 clock),
 # configure second (its policy writes and stale-flag block must settle
 # before anything reads the alarm block). Deliberately NOT
-# Before=wittypi.service: SYS_UP must reach the MCU early, and the flock
+# Before=wittypi.service: SYS_UP must reach the MCU early, and the lock
 # plus the lib's glitch-tolerant reads make the daemon's boot-time reads safe.
 # ⚠️ The daemon DOES write, but only after a halt request: it runs
 # `wake-guard ensure` (WITTYPI_WAKE_GUARD), which may arm a fallback alarm1
 # and pre-arm alarm2 under the same lock. Nothing it does at boot writes.
 After=wittypi-clock.service wittypi-configure.service
 
+# After the RTC write-back too. Only an ordering between JOBS: at boot
+# rtc-save has none (its .path triggers it once NTP syncs), so this costs the
+# boot nothing. It matters when the supervisor asks for both at once — the RTC
+# is off by more than its tolerance AND alarm2 is stale — because a schedule
+# armed from the uncorrected RTC is an appointment at the wrong moment; queued
+# together, the RTC write lands first.
+After=wittypi-rtc-save.service
+
 # After=wake-guard.service is a STOP-order directive — the same derivation as
 # wittypi-watch.service, now for a writer. systemd stops units in the inverse
 # of start order, so on a shutdown that races a mid-write scheduler THIS unit
-# is stopped first: wp_arm_alarm's TERM trap clears day-then-seconds (an inert,
-# unambiguous state) and the flock dies with the process — and only THEN does
-# wake-guard.service's ExecStop run the arming that matters, against a free
-# lock. Before= would instead run ensure against the held lock, give it up
-# after 1 s, and cut the rail with nothing armed. The MCU-initiated path
-# self-heals the same way: the daemon's own direct `ensure` may contend and
-# give up, but the unit's ExecStop ensure runs later, post-trap, and arms.
-# tests/cases/wittypi-schedule.sh pins the direction with a negative
-# assertion so a well-meaning "fix" back to Before= fails the suite.
+# is stopped first: wp_arm_alarm finishes the alarm in hand under TERM (whole
+# and verified, about 1.2 s) and the lock dies with the process — and only
+# THEN does wake-guard.service's ExecStop run the arming that matters,
+# against a free lock. Before= would instead run ensure against the held
+# lock, give it up after 1 s, and cut the rail with nothing armed. The
+# MCU-initiated path self-heals the same way: the daemon's own direct
+# `ensure` may contend and give up, but the unit's ExecStop ensure runs
+# later, post-trap, and arms. tests/cases/wittypi-schedule.sh pins the
+# direction with a negative assertion so a well-meaning "fix" back to
+# Before= fails the suite.
 After=wake-guard.service
 
 # Stopped early in a shutdown transition, same idiom as the other units.
@@ -58,30 +67,41 @@ Type=oneshot
 # visible in systemctl status all cycle.
 RemainAfterExit=yes
 
+# Stand down while a power-off is under way. `wittypi halt-status` reads the
+# halt marker the daemon or the shutdown gate wrote — no I2C, no lock — and
+# exits 1 when one is fresh, which systemd records as a condition skip, not a
+# failure. A scheduler started in that window (a repair, a config change
+# landing at the wrong second) would otherwise rewrite the very stop the
+# shutdown path is about to act on, against the lock it needs.
+ExecCondition=/usr/bin/wittypi halt-status
+
 # wp_rtc_read_confirmed can retry several bracketed multi-field reads on a
 # glitchy bus, and the script also probes for the controller up to 10 times at
 # 1 s intervals before declaring an opted-in node unschedulable. Worst case
-# that is flock's 10 s wait + 10 s of probing + the RTC retries + the arming,
-# which does not fit in 30 s — and being killed at the timeout is precisely the
-# mid-arm interruption the TERM trap exists to survive, rather than a state
-# worth entering on purpose.
+# that is 10 s of probing + the lock's 20 s wait + the RTC retries + the
+# arming, which does not fit in 30 s — and being killed at the timeout is
+# precisely the mid-arm interruption the TERM handling exists to survive,
+# rather than a state worth entering on purpose.
 #
 # 60 s bounds all of it with room to spare. Nothing here is on the shutdown
 # clock, and the cost of the larger bound is paid only on a boot that is
 # already going wrong: a healthy run finishes in around 3 s.
 TimeoutStartSec=60
 
-# The stop path is the TERM trap only (clear two registers, ~0.5 s). NOT a
-# term in the five-term shutdown budget: only a shutdown racing the boot-time
-# run ever stops this mid-flight, and that transition is TXD-detected, not
-# on the register-21 countdown.
+# The stop path finishes the alarm in hand (four writes and a read-back,
+# ~1.2 s) and exits 143. NOT a term in the five-term shutdown budget: only a
+# shutdown racing the boot-time run ever stops this mid-flight, and that
+# transition is TXD-detected, not on the register-21 countdown.
 TimeoutStopSec=5
 
-# The same boot-time lock class as wittypi-clock/-configure: 10 s is
-# generous and none of this is on the shutdown clock. The script itself
-# takes no lock — the trap must run under THIS flock so a half-written
-# alarm can never race wake-guard's 1 s wait.
-ExecStart=/usr/bin/flock -w 10 /run/wittypi.lock /usr/libexec/site/wittypi-schedule
+# The script takes the I2C lock itself (exclusive, 20 s — the writers'
+# class, and none of this is on the shutdown clock), after its controller
+# probe and before its first multi-register read, and holds it through the
+# last read-back, so a half-written alarm can never race wake-guard's 1 s
+# wait. No flock wrapper here: a wrapper plus the in-script lock would wait
+# on itself. A lock it cannot get is exit 75, and this unit lists no success
+# statuses, so that shows as a failed start — which is what it is.
+ExecStart=/usr/libexec/site/wittypi-schedule
 
 # No EnvironmentFile=, deliberately. The script sources
 # /data/wittypi-schedule.env itself, so a typed `wittypi-schedule` at a prompt

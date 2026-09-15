@@ -66,11 +66,15 @@
 # 2. Month-end rollover is unproven on hardware (see WITTYPI-ALARM1.md) —
 # guaranteed wake bounds a miss.
 #
-# No lock taken in-script: the unit wraps ExecStart in flock -w 10 on
-# /run/wittypi.lock, the same boot-time class as wittypi-clock/-configure.
-# wp_arm_alarm finishes an alarm it has started even under TERM, still
-# holding that lock, so wake-guard's ensure (1 s wait, gives up rather than
-# blocks) can never see a half-written appointment.
+# The I2C lock is taken HERE, exclusive, from the first multi-register read
+# (register 49) through the last read-back of the second alarm — and only
+# after the controller probe, so an opted-in node whose controller is not
+# answering never sits on the lock while it waits. 20 s is the writers'
+# class; a lock that cannot be had is exit 75, never a silent skip. Paging
+# happens after the lock is released: notify talks to the network, and the
+# bus must not wait on that. wp_arm_alarm finishes an alarm it has started
+# even under TERM, still holding the lock, so wake-guard's ensure (1 s wait,
+# gives up rather than blocks) can never see a half-written appointment.
 #
 # Overridable paths mirror the other ops tools' test seams; the shipped unit
 # runs the defaults.
@@ -157,6 +161,9 @@ while ! wp_present; do
 done
 [ "$wp_sched_try" -eq 1 ] || \
     wp_log "schedule: the controller answered on probe $wp_sched_try — it was not ready when this unit started"
+
+# ── The lock: after the probe, before the first multi-register read ────────
+wp_lock x "${WITTYPI_LOCK_WAIT:-20}" wittypi-schedule || exit "$WP_EX_LOCK"
 
 # shellcheck source=/dev/null
 . "$WP_SCHED_ENV"
@@ -308,16 +315,19 @@ wp_sched_wake=$(( wp_sched_stop + wp_sched_off ))
 
 # ── alarm1 FIRST — always ──────────────────────────────────────────────────
 if ! wp_arm_alarm "$WP_REG_ALARM1_SEC" "$wp_sched_wake"; then
+    wp_unlock
     wp_log_err "schedule: could NOT arm the wake (alarm1) — alarm2 deliberately untouched; the node stays up rather than scheduling a shutdown with no way back"
     sched_page "scheduler could not arm the wake alarm — node left up, schedule NOT applied"
     exit 1
 fi
 
 if ! wp_arm_alarm "$WP_REG_ALARM2_SEC" "$wp_sched_stop"; then
+    wp_unlock
     wp_log_err "schedule: wake armed but the shutdown (alarm2) could not be — the node will wake on schedule and simply not self-stop this cycle"
     sched_page "scheduler armed the wake but not the shutdown — node will not self-stop this cycle"
     exit 1
 fi
+wp_unlock
 
 # Absolute instants, not "+Ns" offsets: the appointments are phase-anchored
 # now, so an offset from an unstated origin is the one rendering that cannot
