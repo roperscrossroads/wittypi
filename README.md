@@ -130,9 +130,10 @@ the edge cases.
 
 ```sh
 ./tests/lint.sh && ./tests/run.sh
+sh tests/mutate.sh      # every row of tests/mutations.conf must turn its case red
 ```
 
-~650 assertions, host-side only — no I²C, no hardware, no root, no network.
+~1000 assertions, host-side only — no I²C, no hardware, no root, no network.
 They run the shipped scripts against fixtures with `i2cget`/`i2cset`/
 `systemctl` stubbed on `PATH`. A green run means the logic is right; it
 never means it works on the board.
