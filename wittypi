@@ -35,6 +35,12 @@ usage: wittypi <command> [args]
                       applies COMPILED defaults and ignores every site value.
                       Typed at a prompt it therefore REFUSES unless given
                       --compiled-defaults, which says you know that.
+  halt-request <src> [why]
+                      write the halt marker: a power-off is under way, every
+                      unit that could write the controller stands down. The
+                      daemon does this at the controller's request; the
+                      shutdown gate does it for a typed power-off. No I2C, no lock.
+  halt-clear          remove the marker (a gate whose power-off did not happen)
   halt-status         0 when no power-off is under way, 1 when one is (prints
                       the halt marker). No I2C, no lock: an ExecCondition=.
 Every command that touches the bus takes the I2C lock itself: readers shared,
@@ -1005,6 +1011,33 @@ EOF
     wp_cli_term_done "$wp_rc"
     exit "$wp_rc"
     ;;
+halt-request)
+    # No I2C and no lock. The source is a word (daemon, gate); the reason is
+    # free text for the record (the daemon writes the reason register's
+    # code, the gate the verb). Written atomically, state `requested`: the
+    # wake has not been looked at yet — wake-guard's ensure updates it.
+    wp_hr_src="${2:-}"
+    case "$wp_hr_src" in
+        ''|*[!a-z0-9_-]*)
+            printf 'usage: wittypi halt-request <source> [reason]   (source: a word, e.g. gate)\n' >&2
+            exit 64 ;;
+    esac
+    if ! wp_halt_write "$wp_hr_src" "${3:-}" requested; then
+        wp_log_err "could not write the halt marker in $WP_RUN_DIR — the other units will not stand down"
+        exit 1
+    fi
+    printf 'halt requested by %s\n' "$wp_hr_src"
+    exit 0
+    ;;
+
+halt-clear)
+    # The gate removes the marker when its power-off could not be handed over,
+    # so a node that stays up is not left standing down for 120 s.
+    wp_halt_clear
+    printf 'halt marker cleared\n'
+    exit 0
+    ;;
+
 halt-status)
     # No I2C and no lock: this is the ExecCondition= for the units that stand
     # down while a power-off is under way (WITTYPI-ACCESS-AUDIT.md §H2). 0 is

@@ -50,6 +50,10 @@ gate_fixture() {
     chmod +x "$_gf/bin/wake-guard"
     stub "$_gf" notify 'exit 0'
     stub "$_gf" systemctl 'exit 0'
+    # The CLI, for the marker verbs. The image installs it 0755; the repo
+    # copy is not executable, so the gate reaches it through this wrapper.
+    printf '#!/bin/sh\nexec sh "%s" "$@"\n' "$RPI_UNITS_DIR/wittypi" > "$_gf/bin/wittypi"
+    chmod +x "$_gf/bin/wittypi"
     for _n in poweroff halt shutdown; do
         {
             printf '#!/bin/sh\n'
@@ -73,6 +77,9 @@ run_gate() {
         WITTYPI_SHUTDOWN_GATE_NOTIFY="$_f/bin/notify" \
         WITTYPI_SHUTDOWN_GATE_REAL_DIR="$_f/sbin" \
         WITTYPI_SHUTDOWN_GATE_SYSTEMCTL="$_f/bin/systemctl" \
+        WITTYPI_SHUTDOWN_GATE_WITTYPI="${STUB_WITTYPI_PATH:-$_f/bin/wittypi}" \
+        WITTYPI_LIB="$RPI_UNITS_DIR/wittypi-lib.sh" \
+        WITTYPI_RUN_DIR="$_f/run" \
         "$_f/sbin/$_n" "$@" 2>&1
     )
     RUN_RC=$?
@@ -88,6 +95,9 @@ run_gate_verb() {
         WITTYPI_SHUTDOWN_GATE_NOTIFY="$_f/bin/notify" \
         WITTYPI_SHUTDOWN_GATE_REAL_DIR="$_f/sbin" \
         WITTYPI_SHUTDOWN_GATE_SYSTEMCTL="$_f/bin/systemctl" \
+        WITTYPI_SHUTDOWN_GATE_WITTYPI="${STUB_WITTYPI_PATH:-$_f/bin/wittypi}" \
+        WITTYPI_LIB="$RPI_UNITS_DIR/wittypi-lib.sh" \
+        WITTYPI_RUN_DIR="$_f/run" \
         sh "$GATE" "$@" 2>&1
     )
     RUN_RC=$?
@@ -199,12 +209,33 @@ assert_eq "ensure" "$(stub_log "$F" wake-guard)" "gated"
 assert_contains "$(cat "$F/log/real")" 'shutdown.real -h now' "and passed through with the time argument"
 fixture_rm "$F"
 
-describe "bare timed shutdown defaults to poweroff: gated"
+describe "bare timed shutdown defaults to poweroff: gated — as a DELAYED one: check only, no marker"
 F=$(gate_fixture)
 run_gate "$F" shutdown +10
-assert_eq "ensure" "$(stub_log "$F" wake-guard)" "no action flag means poweroff at the given time"
+assert_eq "check" "$(stub_log "$F" wake-guard)" "no action flag means poweroff at the given time; the node stays up for now, so only a check"
+assert_file_absent "$F/run/halt-requested" "no marker — the units must keep working until the time comes"
 assert_contains "$(cat "$F/log/real")" 'shutdown.real +10' "the schedule survives"
 fixture_rm "$F"
+
+describe "a delayed shutdown with nothing armed: says so, pages nothing, proceeds — the ExecStop arms at the time"
+F=$(gate_fixture)
+export STUB_WG_STATE=1
+run_gate "$F" shutdown +10
+assert_contains "$RUN_OUT" 'NOTHING IS ARMED NOW' "the terminal hears it"
+assert_contains "$RUN_OUT" 'ExecStop arms a fallback' "and what will arm it"
+assert_eq "" "$(stub_log "$F" notify)" "no page for a state the ExecStop resolves"
+assert_contains "$(cat "$F/log/real")" 'shutdown.real +10' "proceeds"
+unset STUB_WG_STATE
+fixture_rm "$F"
+
+describe "shutdown +0 and 'now' are immediate: marker and ensure"
+for t in +0 now; do
+    F=$(gate_fixture)
+    run_gate "$F" shutdown -h "$t"
+    assert_eq "ensure" "$(stub_log "$F" wake-guard)" "shutdown -h $t: ensure"
+    assert_file_exists "$F/run/halt-requested" "shutdown -h $t: the marker"
+    fixture_rm "$F"
+done
 
 describe "shutdown -c cancels — gating a cancellation would be absurd"
 F=$(gate_fixture)
@@ -304,7 +335,12 @@ describe "the gate reaches the registers only through wake-guard"
 gate_body=$(grep -v '^\s*#' "$GATE")
 assert_not_contains "$gate_body" 'i2c' "never touches the bus itself"
 assert_not_contains "$gate_body" 'wp_' "never sources the wittypi lib"
-assert_not_contains "$gate_body" '/usr/bin/wittypi' "never spawns the CLI"
+# The one CLI use is the marker: every "$GATE_WITTYPI" call is halt-request
+# or halt-clear, neither of which touches I2C or the lock.
+gate_wp_calls=$(printf '%s\n' "$gate_body" | grep -c '"$GATE_WITTYPI" ')
+gate_wp_marker=$(printf '%s\n' "$gate_body" | grep -cE '"\$GATE_WITTYPI" halt-(request|clear)')
+assert_eq "$gate_wp_calls" "$gate_wp_marker" "the CLI is spawned only for halt-request / halt-clear ($gate_wp_calls call(s))"
+if [ "$gate_wp_marker" -ge 2 ]; then ok "both marker verbs are used (write, and clear on failure)"; else notok "both marker verbs are used" "got $gate_wp_marker"; fi
 assert_not_contains "$gate_body" 'flock' "takes no lock — wake-guard's own flock is the serialization"
 assert_not_contains "$gate_body" 'trap ' "no traps: nothing to clean up, nothing to slow a SIGTERM"
 
@@ -314,6 +350,7 @@ assert_eq "/usr/libexec/site/wake-guard" "$(gate_default GATE_WAKE_GUARD)" "GATE
 assert_eq "/usr/bin/notify"              "$(gate_default GATE_NOTIFY)"     "GATE_NOTIFY"
 assert_eq "/usr/sbin"                    "$(gate_default GATE_REAL_DIR)"   "GATE_REAL_DIR"
 assert_eq "/usr/bin/systemctl"           "$(gate_default GATE_SYSTEMCTL)"  "GATE_SYSTEMCTL"
+assert_eq "/usr/bin/wittypi"             "$(gate_default GATE_WITTYPI)"    "GATE_WITTYPI"
 
 describe "the postprocess wraps exactly three names and polices the fourth"
 # The consuming image is not in this repo, and that is correct.
@@ -362,3 +399,81 @@ fi
 
 describe "the daemon's own path stays clear of the gate by construction"
 assert_contains "$(cat "$RPI_UNITS_DIR/wittypi-daemon")" 'exec systemctl poweroff' "the MCU path calls the verb directly — never the wrapped names"
+
+# ── W10: the halt marker on the gate's immediate path ──────────────────────
+CLI="$RPI_UNITS_DIR/wittypi"
+run_cli() { _f="$1"; shift; RUN_OUT=$(PATH="$_f/bin:$PATH" WITTYPI_LIB="$RPI_UNITS_DIR/wittypi-lib.sh" WITTYPI_RUN_DIR="$_f/run" WITTYPI_LOCK="$_f/lock" sh "$CLI" "$@" 2>&1); RUN_RC=$?; return 0; }
+
+describe "wittypi halt-request / halt-clear: the marker verbs, no I2C, no lock"
+F=$(gate_fixture)
+run_cli "$F" halt-request gate poweroff
+assert_eq "0" "$RUN_RC" "halt-request exits 0"
+assert_contains "$(cat "$F/run/halt-requested" 2>/dev/null)" "source=gate" "source recorded"
+assert_contains "$(cat "$F/run/halt-requested" 2>/dev/null)" "reason=poweroff" "reason recorded"
+assert_contains "$(cat "$F/run/halt-requested" 2>/dev/null)" "state=requested" "state requested"
+run_cli "$F" halt-status
+assert_eq "1" "$RUN_RC" "halt-status now says a halt is under way"
+run_cli "$F" halt-clear
+assert_eq "0" "$RUN_RC" "halt-clear exits 0"
+assert_file_absent "$F/run/halt-requested" "and the marker is gone"
+run_cli "$F" halt-status
+assert_eq "0" "$RUN_RC" "halt-status: none"
+run_cli "$F" halt-request 'bad source;rm'
+assert_eq "64" "$RUN_RC" "a source that is not a word is a usage error"
+assert_file_absent "$F/run/halt-requested" "and writes nothing"
+assert_file_absent "$F/lock" "none of it touched the lock file"
+fixture_rm "$F"
+
+describe "poweroff: the marker is written by the gate BEFORE ensure runs, and stays for the shutdown"
+F=$(gate_fixture)
+{
+    printf '#!/bin/sh\n'
+    printf 'printf "%%s\\n" "$*" >> "%s/log/wake-guard"\n' "$F"
+    printf 'cat "%s/run/halt-requested" >> "%s/log/guard-saw" 2>&1 || echo NO-MARKER >> "%s/log/guard-saw"\n' "$F" "$F" "$F"
+    printf 'exit 0\n'
+} > "$F/bin/wake-guard"; chmod +x "$F/bin/wake-guard"
+run_gate "$F" poweroff
+assert_eq "ensure" "$(stub_log "$F" wake-guard)" "ensure ran"
+assert_contains "$(stub_log "$F" guard-saw)" "source=gate" "and found the gate's marker already there"
+assert_contains "$(stub_log "$F" guard-saw)" "reason=poweroff" "naming the verb"
+assert_file_exists "$F/run/halt-requested" "the marker stays: the power-off is happening"
+assert_contains "$(cat "$F/log/real")" 'poweroff.real' "and the real binary ran"
+fixture_rm "$F"
+
+describe "halt is marked the same way; the verb path too"
+F=$(gate_fixture); run_gate "$F" halt
+assert_contains "$(cat "$F/run/halt-requested" 2>/dev/null)" "reason=halt" "halt: marker names halt"
+fixture_rm "$F"
+F=$(gate_fixture); run_gate_verb "$F" poweroff
+assert_contains "$(cat "$F/run/halt-requested" 2>/dev/null)" "source=gate" "systemctl poweroff (verb mode): marked"
+assert_eq "ensure" "$(stub_log "$F" wake-guard)" "and ensured"
+fixture_rm "$F"
+
+describe "a bypass writes no marker — no wake check means no stand-down either"
+F=$(gate_fixture)
+run_gate "$F" poweroff -f
+assert_file_absent "$F/run/halt-requested" "poweroff -f: no marker"
+fixture_rm "$F"
+F=$(gate_fixture)
+run_gate "$F" shutdown -r now
+assert_file_absent "$F/run/halt-requested" "a reboot: never marked"
+fixture_rm "$F"
+
+describe "the power-off that cannot be handed over clears the marker — a node that stays up must not stand down"
+F=$(gate_fixture)
+rm "$F/sbin/poweroff.real" "$F/bin/systemctl"       # no .real and no systemctl to fall back on
+run_gate "$F" poweroff
+assert_eq "1" "$RUN_RC" "refused"
+assert_contains "$RUN_OUT" 'cannot honor' "and says why"
+assert_file_absent "$F/run/halt-requested" "the marker was cleared"
+assert_eq "ensure" "$(stub_log "$F" wake-guard)" "(the wake had been ensured — harmless)"
+fixture_rm "$F"
+
+describe "the marker CLI unavailable: the power-off still proceeds, and says the units will not stand down"
+F=$(gate_fixture)
+export STUB_WITTYPI_PATH="$F/bin/no-such-wittypi"
+run_gate "$F" poweroff
+assert_contains "$RUN_OUT" 'could not write the halt marker' "named"
+assert_contains "$(cat "$F/log/real")" 'poweroff.real' "proceeds regardless"
+unset STUB_WITTYPI_PATH
+fixture_rm "$F"
