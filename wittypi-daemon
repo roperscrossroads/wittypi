@@ -4,10 +4,13 @@
 # WHAT IT DOES, IN ORDER
 # ----------------------
 #   1. refuses to run if 1-Wire has taken GPIO-4 (the halt line)
-#   2. tells the MCU the system is up, via a pulse train on GPIO-17
-#   3. blocks on GPIO-4 going low — the MCU's shutdown REQUEST
-#   4. runs the bounded pre-shutdown gate (WITTYPI.md, "Design pattern" layer 2)
-#   5. powers off, at which point TXD drops and the MCU cuts the rail
+#   2. waits, bounded, for the controller to answer on the bus
+#   3. tells the MCU the system is up, via a pulse train on GPIO-17
+#   4. blocks on GPIO-4 going low — the MCU's shutdown REQUEST
+#   5. writes the halt marker, so every unit that could write the controller
+#      stands down (wittypi halt-status), then arms the wake with TERM ignored
+#   6. runs the bounded pre-shutdown gate (WITTYPI.md, "Design pattern" layer 2)
+#   7. powers off, at which point TXD drops and the MCU cuts the rail
 #
 # The controller also has its own timeout-based forced cut independent of
 # this daemon (WITTYPI.md, "The three facts that shape everything") — the
@@ -82,14 +85,31 @@ if [ ! -e "$WP_I2C_DEV" ]; then
     exit 1
 fi
 
-# ── Absent controller is not an error ──────────────────────────────────────
+# ── Absent controller is not an error — but one miss is not an answer ──────
 # A Pi on the bench with no Witty Pi fitted is a normal configuration. Exit 0
 # so the unit doesn't enter failed state and drag other boot targets down
 # with it.
-if ! wp_present; then
-    wp_log "no controller at $WP_ADDR on i2c-$WP_BUS — not fitted. Nothing to sequence."
-    exit 0
-fi
+#
+# Bounded retry, because the expensive failure is the other one (audit D14):
+# this unit starts ~28 s into boot, and a cold ATtiny that is not ready yet
+# reads exactly like an absent one. Believing the first miss costs SYS_UP,
+# the GPIO-4 watch and the rail cut for the whole boot, logged as the normal
+# bench case. wp_get_stable retries at the read level; this waits for the
+# device to exist. A healthy boot never enters the loop.
+WP_DAEMON_PROBE_TRIES="${WITTYPI_DAEMON_PROBE_TRIES:-10}"
+wp_probe=1
+while ! wp_present; do
+    if [ "$wp_probe" -eq 1 ]; then
+        wp_log "controller did not answer on probe 1: register 0 did not read 0x26 twice — retrying up to $WP_DAEMON_PROBE_TRIES times"
+    fi
+    if [ "$wp_probe" -ge "$WP_DAEMON_PROBE_TRIES" ]; then
+        wp_log "no controller at $WP_ADDR on i2c-$WP_BUS after $WP_DAEMON_PROBE_TRIES probes — not fitted. Nothing to sequence."
+        exit 0
+    fi
+    wp_probe=$(( wp_probe + 1 ))
+    sleep 1
+done
+[ "$wp_probe" -eq 1 ] || wp_log "controller answered on probe $wp_probe — it was not ready when this unit started"
 
 wp_rev=$(wp_get "$WP_REG_FW_REVISION") || wp_rev="?"
 wp_reason=$(wp_get "$WP_REG_ACTION_REASON") || wp_reason="?"
@@ -176,7 +196,20 @@ gpiomon -b pull-up -e falling -n 1 -c "$wp_chip" "$WP_HALT_PIN" >/dev/null 2>&1 
     exit 1
 }
 
+# ── The halt marker, before anything else ──────────────────────────────────
+# /run/wittypi/halt-requested is how every unit that could write the
+# controller learns a power-off is under way (`wittypi halt-status` is their
+# ExecCondition; the scheduler and the CLI's writers check it in-script).
+# It is written BEFORE the reason register is read: the point is that the
+# scheduler, the keeper and the watch stand down from this instant, and a
+# register read is one more thing that can wait on the bus. The reason is
+# filled in a moment later. State `requested` says the wake has not been
+# looked at yet; `wake-guard ensure` updates it once it has.
+wp_halt_write daemon "" requested || \
+    wp_log "WARNING: could not write the halt marker in $WP_RUN_DIR — the other units will not stand down"
+
 wp_reason=$(wp_get "$WP_REG_ACTION_REASON") || wp_reason="?"
+wp_halt_update reason "$wp_reason" 2>/dev/null || true
 case "$wp_reason" in
     "$WP_REASON_ALARM2")            wp_why="scheduled shutdown (alarm2)" ;;
     "$WP_REASON_CLICK")             wp_why="button clicked or GPIO-$WP_HALT_PIN pulled low" ;;
@@ -211,8 +244,20 @@ wp_log "shutdown requested: $wp_why"
 # the guard just fixed. Reversed, the board would announce "wake set for
 # NONE" and then quietly wake anyway, which is the more confusing failure,
 # because it teaches you to distrust a message that is in fact working.
+#
+# ── With TERM ignored, because a shutdown may already be under way ─────────
+# The controller can ask while Linux is already stopping (a typed poweroff
+# that the MCU's request overtakes, a reboot the rail cut turns into a halt).
+# Then this unit is being stopped too, and systemd's TERM would land in the
+# middle of the pre-arm: four writes and a read-back on the one alarm that
+# rescues a boot which never reaches the scheduler (audit D9). The hook runs
+# in a subshell that ignores TERM and INT before it execs; an ignored
+# disposition survives exec and is inherited by every i2cset it spawns, so
+# the arm finishes whatever the stop job does. The unit's TimeoutStopSec=10
+# is the bound: after it, KILL — and the day register is written last, so
+# even that leaves no half-alarm that can match.
 if [ -x "$WP_WAKE_GUARD" ]; then
-    "$WP_WAKE_GUARD" ensure || true
+    ( trap '' TERM INT; exec "$WP_WAKE_GUARD" ensure ) || true
 fi
 
 # Failure is ignored on purpose: a well-behaved notifier exits 0 by

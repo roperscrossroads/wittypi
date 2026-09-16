@@ -31,6 +31,13 @@ ExecStart=/usr/libexec/site/wittypi-daemon
 # controller fitted", which is a normal bench configuration.
 Restart=on-failure
 RestartSec=10s
+# The stop bound is the pre-arm's bound. At a scheduled power-off this unit's
+# own `wake-guard ensure` (TERM ignored, see the daemon) may still be writing
+# the next window's stop when the stop job reaches it: a 2 s lock wait, one
+# register-49 check, up to two four-register arms with read-back — under 6 s
+# measured. 10 s holds that with margin and still sits inside the power-cut
+# clock, on which the ExecStop of wake-guard.service comes after this unit.
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
