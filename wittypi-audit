@@ -6,12 +6,21 @@
 # already holding a terminal.
 #
 # READ-ONLY, structurally (the same assertions that pin wittypi-watch pin
-# this): no writes, no lock, no traps. It reads through the same sources
-# the machinery uses — `wittypi` for the registers (stable-read dispatch
+# this): no writes, no traps. It reads through the same sources the
+# machinery uses — `wittypi` for the registers (stable-read dispatch
 # included), `wake-guard check` for alarm1's tri-state (no reimplementation
 # of armed()'s day-validation), wp_check_guaranteed_wake() shared with the
 # supervisor so the two can never render different verdicts from the same
 # registers.
+#
+# The I2C lock: SHARED, per register section, 5 s (WITTYPI_LOCK_WAIT), and
+# released between sections. Readers share, so this never keeps another
+# reader out; it keeps a writer's half-applied table or half-armed alarm
+# from being read as fact. The `wittypi` children inherit it and are covered
+# at once. It is released BEFORE `wake-guard check`, which takes its own
+# lock, and before the sections that read only files. A lock that is not
+# free within the wait skips that section with a visible line and makes the
+# exit status 75: a report with a hole in it must not read as a clean one.
 #
 # What it deliberately does NOT cover: the timing-budget axis. That is
 # timing-windows' whole job — a different question, and duplicating it here
@@ -40,16 +49,33 @@ if ! wp_present; then
     exit 1
 fi
 
-# The same effective intent the units see, in the same precedence:
-# environment (a bench override) > /data/wittypi.env > the board registry.
-# The site file is GREPPED, not sourced — EnvironmentFile= does not execute
-# its file and neither does this. Only the one variable the audit compares
-# is pulled; the full table comparison is `wittypi check`'s job.
-if [ -z "${WITTYPI_GUARANTEED_WAKE+x}" ] && [ -r "$WP_AUDIT_ENV" ]; then
-    wp_a_gw=$(sed -n 's/^WITTYPI_GUARANTEED_WAKE=//p' "$WP_AUDIT_ENV" | sed -n 1p)
-    [ -n "$wp_a_gw" ] && WITTYPI_GUARANTEED_WAKE=$wp_a_gw
-fi
+# Register 49's intended value comes from the lib's one precedence rule —
+# the policy file wake-policy derived from the schedule, then the
+# environment (a bench override), then /data/wittypi.env — the same rule
+# configure applies and the watch compares against, so the three can never
+# disagree about what "drifted" means. Files are grepped, never sourced.
+# Only this one variable is pulled; the full table is `wittypi check`'s job.
+# shellcheck disable=SC2034  # read by the lib's wp_guaranteed_wake_policy
+WP_SITE_ENV="$WP_AUDIT_ENV"
+wp_a_gwp=$(wp_guaranteed_wake_policy) || wp_a_gwp=""
+wp_a_gw_want=${wp_a_gwp%	*}
+wp_a_gw_src=${wp_a_gwp#*	}
+case "$wp_a_gw_src" in
+    policy) wp_a_gw_from="the policy file ($WP_POLICY_ENV)" ;;
+    env)    wp_a_gw_from="the environment" ;;
+    site)   wp_a_gw_from="the site policy" ;;
+    *)      wp_a_gw_from="" ;;
+esac
 wp_load_board_env >/dev/null 2>&1 || true
+wp_a_busy=0
+wp_a_section_lock() { # <section>: 0 holding the shared lock, 1 (and a line) if the bus is busy
+    if wp_lock s "${WITTYPI_LOCK_WAIT:-5}" wittypi-audit 2>/dev/null; then
+        return 0
+    fi
+    printf '%-11s !! BUS BUSY — the I2C lock was not free within %ss; section skipped\n' "$1" "${WITTYPI_LOCK_WAIT:-5}"
+    wp_a_busy=1
+    return 1
+}
 
 echo "── wittypi-audit — $(date -u '+%Y-%m-%d %H:%M:%S') UTC$(wp_utc_note) ──────────────"
 
@@ -64,7 +90,8 @@ else
     printf 'board       identity unreadable (no serial, no wlan0 MAC)\n'
 fi
 
-# ── controller ─────────────────────────────────────────────────────────────
+# ── controller and clock: one shared lock, released before alarm1 ──────────
+if wp_a_section_lock controller; then
 echo "controller"
 "$WP_AUDIT_WITTYPI" status 2>&1 | sed 's/^/    /'
 
@@ -87,6 +114,8 @@ if wp_a_rtc=$("$WP_AUDIT_WITTYPI" rtc 2>/dev/null); then
 else
     echo 'rtc         !! UNREADABLE — run "wittypi rtc" for the specific complaint'
 fi
+wp_unlock
+fi
 
 # ── alarm1, the wake ───────────────────────────────────────────────────────
 # wake-guard's own tri-state and its own words: its check logs the decoded
@@ -100,6 +129,9 @@ case $? in
     *) printf 'alarm1      !! UNREADABLE (%s)\n' "${wp_a_wg#wake-guard: }" ;;
 esac
 
+# ── alarm2 and guaranteed wake: the second shared lock ─────────────────────
+wp_a2_state=unreadable
+if wp_a_section_lock alarm2; then
 # ── alarm2, the shutdown ───────────────────────────────────────────────────
 # The registers only this tool surfaces to a human (they were invisible
 # outside raw i2cget until the alarm blocks got names). Plain BCD, day-last
@@ -133,18 +165,20 @@ case "$wp_a2_s$wp_a2_m$wp_a2_h$wp_a2_d" in
 esac
 
 # ── guaranteed wake — the shared verdict, never a second opinion ───────────
-wp_a_gwv=$(wp_check_guaranteed_wake "${WITTYPI_GUARANTEED_WAKE:-}")
+wp_a_gwv=$(wp_check_guaranteed_wake "${wp_a_gw_want:-}")
 case $? in
-    0) if [ -n "${WITTYPI_GUARANTEED_WAKE:-}" ]; then
-           printf 'guaranteed  register 49 = %s — matches the site policy\n' "$wp_a_gwv"
+    0) if [ -n "${wp_a_gw_want:-}" ]; then
+           printf 'guaranteed  register 49 = %s — matches %s\n' "$wp_a_gwv" "$wp_a_gw_from"
        else
            printf 'guaranteed  register 49 = %s — enabled (no site policy stated to compare)\n' "$wp_a_gwv"
        fi ;;
-    1) printf 'guaranteed  !! DRIFTED — register 49 reads %s, site policy says %s\n' \
-           "$wp_a_gwv" "$WITTYPI_GUARANTEED_WAKE" ;;
+    1) printf 'guaranteed  !! DRIFTED — register 49 reads %s, policy says %s (from %s)\n' \
+           "$wp_a_gwv" "$wp_a_gw_want" "$wp_a_gw_src" ;;
     3) printf 'guaranteed  !! DISABLED — register 49 is 0: no last-resort wake\n' ;;
     *) printf 'guaranteed  !! UNREADABLE\n' ;;
 esac
+wp_unlock
+fi
 
 # ── the scheduler ──────────────────────────────────────────────────────────
 if [ -r "$WP_AUDIT_SCHEDULE" ]; then
@@ -195,4 +229,6 @@ else
 fi
 
 echo "── timing budgets are a different question: run timing-windows"
+# A report with a skipped section is not a clean report.
+[ "$wp_a_busy" = 0 ] || exit "$WP_EX_LOCK"
 exit 0

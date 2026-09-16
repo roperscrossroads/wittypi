@@ -87,6 +87,9 @@ run_audit() {
         WITTYPI_AUDIT_SCHEDULE="$1/data/wittypi-schedule.env" \
         WITTYPI_AUDIT_RECORD="$1/data/watch-hazards" \
         WITTYPI_AUDIT_SYNCED="$1/synced" \
+        WITTYPI_LOCK="$1/lock" \
+        WITTYPI_RUN_DIR="$1/run" \
+        WITTYPI_POLICY_ENV="$1/policy.env" \
         sh "$AUDIT" 2>&1
     )
     RUN_RC=$?
@@ -131,7 +134,7 @@ F=$(audit_fixture)
 seq_set "$F" "0x14" 49
 export STUB_NOW=$(( RTC_EPOCH + 3 )) WITTYPI_BOARD_ID=t
 run_audit "$F"
-assert_contains "$RUN_OUT" 'DRIFTED — register 49 reads 20, site policy says 26' "drift names both numbers"
+assert_contains "$RUN_OUT" 'DRIFTED — register 49 reads 20, policy says 26 (from site)' "drift names both numbers, and where the intent came from"
 seq_set "$F" "0x00" 49
 run_audit "$F"
 assert_contains "$RUN_OUT" 'DISABLED — register 49 is 0' "zero is the loud verdict, same as the supervisor's"
@@ -164,7 +167,10 @@ describe "the audit is a pure reader, structurally — same bar as the superviso
 audit_body=$(grep -v '^\s*#' "$AUDIT")
 assert_not_contains "$audit_body" 'i2cset' "never touches i2cset"
 assert_not_contains "$audit_body" 'wp_set' "never calls wp_set"
-assert_not_contains "$audit_body" 'flock' "takes no lock"
+assert_not_contains "$audit_body" 'flock' "never flock directly — the lib's wp_lock is the one lock"
+assert_eq "1" "$(printf '%s\n' "$audit_body" | grep -c 'wp_lock s ')" "takes the lock SHARED, in one helper, never exclusive"
+assert_eq "0" "$(printf '%s\n' "$audit_body" | grep -c 'wp_lock x')" "and never exclusive"
+assert_eq "2" "$(printf '%s\n' "$audit_body" | grep -c '^wp_unlock$')" "released after each of the two register sections"
 assert_not_contains "$audit_body" 'trap ' "no traps"
 
 describe "the recipe ships it where humans type"
@@ -210,4 +216,49 @@ run_audit "$F"
 assert_contains "$RUN_OUT" 'SHUTDOWN scheduled: day 13 at 23:00:00 UTC' "the appointment decodes"
 assert_contains "$RUN_OUT" 'consistent with a running schedule' "and the delta agrees"
 unset STUB_NOW WITTYPI_BOARD_ID STUB_A2_DAY STUB_A2_HOUR
+fixture_rm "$F"
+
+describe "the lock is released before wake-guard check runs (it takes its own), and before the file sections"
+if command -v flock >/dev/null 2>&1; then
+F=$(audit_fixture)
+printf '#!/bin/sh\nif flock -n "%s/lock" true 2>/dev/null; then echo FREE; else echo HELD; fi >> "%s/log/lockstate"\nexit 1\n' "$F" "$F" > "$F/bin/wake-guard"
+chmod +x "$F/bin/wake-guard"
+export STUB_NOW=$(( RTC_EPOCH + 3 )) WITTYPI_BOARD_ID=t
+run_audit "$F"
+assert_eq "0" "$RUN_RC" "a clean report"
+assert_eq "FREE" "$(cat "$F/log/lockstate" 2>/dev/null)" "wake-guard check saw a free lock"
+unset STUB_NOW WITTYPI_BOARD_ID
+fixture_rm "$F"
+else printf '    SKIP flock not on this host\n'; fi
+
+describe "a busy bus: the register sections are skipped with a visible line, the rest is reported, exit 75"
+if command -v flock >/dev/null 2>&1; then
+F=$(audit_fixture); : > "$F/lock"
+flock -x "$F/lock" sleep 6 & HOLDER=$!
+sleep 0.3
+export STUB_NOW=$(( RTC_EPOCH + 3 )) WITTYPI_BOARD_ID=t WITTYPI_LOCK_WAIT=0
+run_audit "$F"
+unset WITTYPI_LOCK_WAIT
+assert_eq "75" "$RUN_RC" "exit 75: the report has holes"
+assert_contains "$RUN_OUT" 'controller  !! BUS BUSY — the I2C lock was not free within 0s; section skipped' "the controller/clock section says why it is missing"
+assert_contains "$RUN_OUT" 'alarm2      !! BUS BUSY' "and the alarm2/guaranteed section"
+assert_not_contains "$RUN_OUT" 'firmware id 0x26' "no register was read under contention"
+assert_contains "$RUN_OUT" 'not armed — fine while up' "alarm1 (wake-guard, its own lock) is still reported"
+assert_contains "$RUN_OUT" 'HAND-SCHEDULED mode' "and the file-only sections too"
+unset STUB_NOW WITTYPI_BOARD_ID
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+fixture_rm "$F"
+else printf '    SKIP flock not on this host\n'; fi
+
+describe "register 49's intent comes from the policy file first, and the report names the source"
+F=$(audit_fixture)
+printf 'WITTYPI_GUARANTEED_WAKE=16\n' > "$F/policy.env"
+seq_set "$F" "0x10" 49
+export STUB_NOW=$(( RTC_EPOCH + 3 )) WITTYPI_BOARD_ID=t
+run_audit "$F"
+assert_contains "$RUN_OUT" "register 49 = 16 — matches the policy file ($F/policy.env)" "16 from the policy file beats the site file's 26"
+seq_set "$F" "0x1a" 49
+run_audit "$F"
+assert_contains "$RUN_OUT" 'DRIFTED — register 49 reads 26, policy says 16 (from policy)' "a board still at the site's 26 has drifted from the floored 16"
+unset STUB_NOW WITTYPI_BOARD_ID
 fixture_rm "$F"
