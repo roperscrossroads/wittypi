@@ -93,17 +93,29 @@ T_MARKGOOD=316
 #     nothing pre-armed, no gate                                ExecStop decides from
 #     the job queue, arms the fallback and pre-arms itself, 2.87 s
 #
-# The last row is the carried value. It is a real code path — anything that
-# reaches wake-guard.service with no marker — and nothing else reserves budget
-# for it. On the controller path the daemon's own ensure (budgeted separately,
-# 5 s) arms first, and request -> power down measured 12.8-14.5 s uncontended
-# and 18.5 s under the 34 s holder, against the 25 s cut.
+# The last row is this term: the path where NOTHING ran before the shutdown —
+# anything that reaches wake-guard.service with no marker — so the ExecStop's
+# own arm is inside it and it stands alone on the power-cut clock. The rows
+# with the wake already armed are T_SHUTDOWN_ARMED below; timing-windows
+# budgets the two paths separately, because they never both run.
 #
 # One clean shutdown per path. A node with more dirty pages, a unit slow to
 # stop, or a tired card takes longer, and the power-cut budget does not
 # stretch. Treat the slack over this number as the real safety margin, not the
 # number itself.
 T_SHUTDOWN=9
+
+# Halt request -> "reboot: Power down" when the wake is ALREADY ARMED as the
+# shutdown starts: the controller's alarm2 (the daemon's ensure ran first and
+# wrote the halt marker) or a typed poweroff through the gate (same marker).
+# wake-guard.service's ExecStop then verifies four registers and writes
+# nothing. This is the path that SHARES the power-cut clock with the daemon's
+# ensure, the notify and the mark-good grace, so timing-windows sums it with
+# those caps — and sums T_SHUTDOWN alone.
+# Measured 2026-09-16: 6.04-6.64 s over 16 controller cycles and 6.92 s for a
+# typed poweroff through the gate, first "Stopping" -> "Power down". Carried as
+# the worst, rounded up. Request -> power down on this path: 12.8-14.5 s.
+T_SHUTDOWN_ARMED=7
 
 # ── FIRMWARE — Witty Pi 4, ATtiny841 ───────────────────────────────────────
 # Read from WittyPi4.ino. Every counter here is a 1 Hz watchdog tick

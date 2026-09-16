@@ -226,6 +226,7 @@ term() {
 T_BOOT=$(term T_BOOT)
 T_MARKGOOD=$(term T_MARKGOOD)
 T_SHUTDOWN=$(term T_SHUTDOWN)
+T_SHUTDOWN_ARMED=$(term T_SHUTDOWN_ARMED)
 
 FW_REV_TERM=$(term FW_REV)
 ALARM_WIN=$(term FW_ALARM_WINDOW)
@@ -543,7 +544,8 @@ row "sleep pulse (reg 18)" "${PULSE}s" "firmware factory default; policy does no
 hdr "LINUX — measured"
 row "T_boot   power-on -> gate" "${T_BOOT}s" "console capture, anchored to btime"
 row "T_markgood power-on -> 3" "${T_MARKGOOD}s" "fw_printenv across four cycles"
-row "T_shutdown" "${T_SHUTDOWN}s" "halt request -> Power down"
+row "T_shutdown" "${T_SHUTDOWN}s" "halt request -> Power down, NOTHING armed (poweroff.real)"
+row "T_shutdown_armed" "${T_SHUTDOWN_ARMED}s" "halt request -> Power down, wake already armed (alarm2, the gate)"
 
 hdr "LINUX — configured"
 row "health soak" "${SOAK}s" "to UPTIME ${SOAK}s, not ${SOAK}s after the gate"
@@ -599,45 +601,56 @@ hdr "RELATIONSHIPS — each one has been violated at least once"
 
 # 1. The shutdown must finish before the rail is cut. This is THE invariant:
 #    everything downstream of a cut mid-write is a corrupt /data.
-# T_SHUTDOWN includes wake-guard.service's ExecStop, measured from a real
-# `systemctl poweroff` console capture. It is close to a WORST case, not a
-# typical one: alarm1 was cleared before that capture, so the ExecStop took the
-# slow "arm from nothing" path (4.004s of the 8.022s total) rather than the
-# fast already-armed recheck (~0.7s) the real controller-initiated path should
-# usually hit, because wittypi-daemon's own wake-guard call (WAKE_GUARD_SD,
-# budgeted separately below) normally arms it first. A Linux-initiated shutdown
-# with nothing pre-armed gets no such reservation and pays the full cost
-# captured here — a real path, not a contrived one. See timing-terms for the
-# full breakdown.
-# WATCH_SD is the supervisor's term: a shutdown racing a wittypi-watch tick
-# stops the watch first, serialised ahead of wake-guard's ExecStop by the unit
-# ordering, so its TimeoutStopSec is a fifth term.
-_SD_TOTAL=$(( WATCH_SD + WAKE_GUARD_SD + NOTIFY_SD + GRACE_EFF + T_SHUTDOWN ))
-if [ "$_SD_TOTAL" -lt "$PCD" ]; then
-    ok "watch + wake-guard + notify + grace + shutdown < power-cut: ${WATCH_SD} + ${WAKE_GUARD_SD} + ${NOTIFY_SD} + ${GRACE_EFF} + ${T_SHUTDOWN} = ${_SD_TOTAL} < ${PCD}s"
-    # Passing is not the same as having room. T_shutdown is ONE measurement of
-    #    a clean shutdown; a node with more dirty pages, a unit that is slow to
-    #    stop, or a `sync` against a tired card takes longer, and the budget does
-    #    not stretch. The slack should be at least another whole shutdown — so
-    #    that the measurement being wrong by 100% is survivable rather than a
-    #    cut mid-write. At the compiled 15s it is 1s.
-    _slack=$(( PCD - _SD_TOTAL ))
-    note "T_shutdown (${T_SHUTDOWN}s) is a real capture, but close to a
-        worst case (a full wake-guard arm, not its fast recheck) — see timing-terms."
-    if [ "$_slack" -lt "$T_SHUTDOWN" ]; then
-        # The advice has to key off the headroom that actually remains, not
-        # off the configured delay. This note only fires when the slack is
-        # LESS than one shutdown, so any wording claiming that two shutdowns
-        # fit would contradict the branch it is printed from.
-        note "$(printf 'but only %ss of slack, against a shutdown measured ONCE at %ss. A shutdown\n        that runs %ss over budget is cut mid-write. %s' \
-            "$_slack" "$T_SHUTDOWN" "$_slack" \
-            "$([ "$PCD" -lt "$PCD_MAX" ] \
-                && printf 'Raising the power-cut delay to %ss (the ceiling) would buy %ss more\n        for nothing but a longer wait before the rail drops.' "$PCD_MAX" "$(( PCD_MAX - PCD ))" \
-                || printf 'The delay is already at its %ss ceiling. The shutdown notify timeout has\n        already been cut 3s -> 2s (untested) to claw back 1s; the rest needs\n        a re-measurement of the fast (already-armed) wake-guard path or a smaller grace.' "$PCD_MAX")")"
-    fi
+#
+#    Two paths share the power-cut clock, differently, and they never both run:
+#
+#    A. the wake is ARMED when the shutdown starts — the controller's alarm2
+#       (wittypi-daemon runs wake-guard ensure, budgeted by WAKE_GUARD_SD, then
+#       the notify, then waits out the mark-good grace) or a typed poweroff
+#       through the gate (the same marker). The shutdown itself is
+#       T_SHUTDOWN_ARMED: wake-guard.service's ExecStop only verifies.
+#    B. NOTHING armed — poweroff.real, a script's /usr/bin/systemctl poweroff,
+#       anything that reaches wake-guard.service with no marker. None of A's
+#       steps run; the ExecStop arms the fallback inside its own stop timeout,
+#       and that is inside T_SHUTDOWN, the only term on this path.
+#
+#    WATCH_SD is on both: a supervisor tick can be running at either start,
+#    and the unit ordering stops it ahead of wake-guard's ExecStop. Each path
+#    must fit on its own; the verdict is the path with the least slack. Until
+#    2026-09-16 this check summed A's caps onto B's shutdown, and with the
+#    re-measured terms reported 25 >= 25 against a controller path measured
+#    at 12.8-14.5 s: a hazard the hardware never showed.
+_SD_A=$(( WATCH_SD + WAKE_GUARD_SD + NOTIFY_SD + GRACE_EFF + T_SHUTDOWN_ARMED ))
+_SD_B=$(( WATCH_SD + T_SHUTDOWN ))
+_A_TXT="${WATCH_SD} + ${WAKE_GUARD_SD} + ${NOTIFY_SD} + ${GRACE_EFF} + ${T_SHUTDOWN_ARMED} = ${_SD_A}"
+_B_TXT="${WATCH_SD} + ${T_SHUTDOWN} = ${_SD_B}"
+if [ "$_SD_A" -lt "$PCD" ]; then
+    ok "path A, wake armed: watch + wake-guard + notify + grace + shutdown(armed) < power-cut: ${_A_TXT} < ${PCD}s"
 else
-    haz "watch + wake-guard + notify + grace + shutdown >= power-cut: ${WATCH_SD} + ${WAKE_GUARD_SD} + ${NOTIFY_SD} + ${GRACE_EFF} + ${T_SHUTDOWN} = ${_SD_TOTAL} >= ${PCD}s" \
-        "the rail falls mid-shutdown. /data is mounted rw until the very end of it."
+    haz "path A, wake armed: watch + wake-guard + notify + grace + shutdown(armed) >= power-cut: ${_A_TXT} >= ${PCD}s" \
+        "the rail falls mid-shutdown on the CONTROLLER path — every scheduled stop. /data is mounted rw until the very end of it."
+fi
+if [ "$_SD_B" -lt "$PCD" ]; then
+    ok "path B, nothing armed: watch + shutdown(unarmed) < power-cut: ${_B_TXT} < ${PCD}s"
+else
+    haz "path B, nothing armed: watch + shutdown(unarmed) >= power-cut: ${_B_TXT} >= ${PCD}s" \
+        "the rail falls mid-shutdown on a Linux-initiated power-off with nothing armed. /data is mounted rw until the very end of it."
+fi
+_slack_a=$(( PCD - _SD_A )); _slack_b=$(( PCD - _SD_B ))
+if [ "$_slack_a" -le "$_slack_b" ]; then _worst=A; _slack=$_slack_a; _wterm=$T_SHUTDOWN_ARMED; _wname=T_shutdown_armed
+else _worst=B; _slack=$_slack_b; _wterm=$T_SHUTDOWN; _wname=T_shutdown; fi
+note "worst case is path ${_worst}: ${_slack}s of slack against the ${PCD}s power cut. Both shutdown terms are real
+        captures of a CLEAN shutdown (see timing-terms); a node with more dirty pages or a tired card takes longer."
+if [ "$_slack" -ge 0 ] && [ "$_slack" -lt "$_wterm" ]; then
+    # Passing is not the same as having room. The slack should be at least
+    #    another whole shutdown — so that the measurement being wrong by 100%
+    #    is survivable rather than a cut mid-write. The advice keys off the
+    #    headroom that actually remains, not off the configured delay.
+    note "$(printf 'but only %ss of slack on path %s, against %s measured at %ss. A shutdown\n        that runs %ss over budget is cut mid-write. %s' \
+        "$_slack" "$_worst" "$_wname" "$_wterm" "$_slack" \
+        "$([ "$PCD" -lt "$PCD_MAX" ] \
+            && printf 'Raising the power-cut delay to %ss (the ceiling) would buy %ss more\n        for nothing but a longer wait before the rail drops.' "$PCD_MAX" "$(( PCD_MAX - PCD ))" \
+            || printf 'The delay is already at its %ss ceiling; the rest needs a smaller term on\n        that path — a shorter grace or notify on A, a faster unarmed ExecStop on B.' "$PCD_MAX")")"
 fi
 
 # 2. Register 21 is deci-seconds in ONE BYTE, and 255 is the never-written
