@@ -170,7 +170,10 @@ printf '0x09\n' > "$F/regs/58"; printf '0x31\n' > "$F/regs/59"
 run_sched "$F"
 _second=$(printf '%s' "$RUN_OUT" | grep -o 'shutdown [0-9-]* [0-9:]*')
 assert_eq "$_first" "$_second" "same shutdown instant 90s later — a re-run is a no-op, not a new schedule"
-assert_contains "$RUN_OUT" 'armed register-32 alarm for day 13 at 22:41:00 UTC' "and it is still the phase-anchored value"
+assert_contains "$RUN_OUT" 'shutdown 2026-08-13 22:41:00' "and it is still the phase-anchored value"
+assert_contains "$RUN_OUT" 'alarm2 already holds the stop' "the registers already hold it, so it is not rewritten"
+assert_contains "$RUN_OUT" 'alarm1 already holds the wake' "nor is the wake"
+assert_eq "10" "$(wc -l < "$F/log/i2cset" | tr -d ' ')" "the second run wrote NOTHING — the ten writes are all from the first"
 fixture_rm "$F"
 
 describe "in-window boot: the CURRENT window's stop is used, no cycle skipped"
@@ -225,8 +228,12 @@ run_sched "$F"
 assert_contains "$RUN_OUT" 'armed register-32 alarm for day 25 at 03:55:00 UTC' "03:05 run -> same stop"
 printf '0x00\n' > "$F/regs/58"; printf '0x39\n' > "$F/regs/59"
 run_sched "$F"
-assert_contains "$RUN_OUT" 'armed register-32 alarm for day 25 at 03:55:00 UTC' "03:39 run -> same stop"
-assert_contains "$RUN_OUT" 'armed register-27 alarm for day 25 at 04:00:00 UTC' "and the same wake"
+# The second run finds the registers already holding the pair: the summary
+# still names the same instants, and nothing is rewritten.
+assert_contains "$RUN_OUT" 'shutdown 2026-08-25 03:55:00' "03:39 run -> same stop"
+assert_contains "$RUN_OUT" 'alarm2 already holds the stop (day 25 at 03:55:00 UTC)' "held, not rewritten"
+assert_contains "$RUN_OUT" 'wake 2026-08-25 04:00:00' "and the same wake"
+assert_contains "$RUN_OUT" 'alarm1 already holds the wake (day 25 at 04:00:00 UTC)' "also held"
 fixture_rm "$F"
 
 describe "the root cause: a config written while the node is UP does nothing until re-run"
@@ -843,3 +850,107 @@ assert_eq "1" "$RUN_RC" "the arm failed (alarm1's day did not take)"
 assert_eq "FREE" "$(cat "$F/log/lockstate" 2>/dev/null)" "notify ran with the lock already released"
 fixture_rm "$F"
 else printf '    SKIP flock not on this host\n'; fi
+
+# ── W8: stand-downs, keep-current-stop, and rewriting only what differs ────
+# The marker the daemon writes at the request (WITTYPI-ACCESS-AUDIT.md §H2).
+sched_marker() { mkdir -p "$1/run"; printf 'source=daemon\nuptime=%s\nreason=2\nstate=requested\na1=\na2=\n' "$(cut -d. -f1 /proc/uptime)" > "$1/run/halt-requested"; }
+# After a first run the register file holds stop 22:41:00 / wake 23:11:00.
+sched_armed_fixture() { _saf=$(sched_fixture); run_sched "$_saf" >/dev/null; : > "$_saf/log/i2cset"; printf '%s' "$_saf"; }
+
+describe "D10: a rerun 30 s before an ARMED, unfired stop keeps it — zero writes, not a cycle skipped"
+F=$(sched_armed_fixture)
+printf '0x30\n' > "$F/regs/58"; printf '0x40\n' > "$F/regs/59"; printf '0x22\n' > "$F/regs/60"   # RTC 22:40:30
+set_uptime "$F" 5000
+run_sched "$F"
+assert_eq "0" "$RUN_RC" "exits 0"
+assert_contains "$RUN_OUT" "keeping this window's stop at 22:41:00 UTC, 30s ahead" "it keeps the armed stop and says how close it is"
+assert_contains "$RUN_OUT" 'shutdown 2026-08-13 22:41:00' "the summary still names it"
+assert_eq "" "$(set_seq "$F")" "and nothing is written"
+assert_not_contains "$RUN_OUT" 'skipping' "no cycle skipped"
+fixture_rm "$F"
+
+describe "D10 does not override the mark-good floor: an armed stop this boot cannot survive is still moved"
+F=$(sched_armed_fixture)
+printf '0x30\n' > "$F/regs/58"; printf '0x40\n' > "$F/regs/59"; printf '0x22\n' > "$F/regs/60"
+set_uptime "$F" 10                                   # booted 10 s ago: floor is 362 s out
+run_sched "$F"
+assert_eq "0" "$RUN_RC" "exits 0"
+assert_contains "$RUN_OUT" 'skipping 1 cycle(s)' "the stop moves a cycle"
+assert_not_contains "$RUN_OUT" 'keeping' "and is not kept"
+assert_contains "$(set_seq "$F")" "32 33 34 35 40" "alarm2 is rewritten"
+fixture_rm "$F"
+
+describe "a matching alarm whose latch is SET is rewritten — a fired appointment is not an armed one"
+F=$(sched_armed_fixture)
+printf '0x30\n' > "$F/regs/58"; printf '0x40\n' > "$F/regs/59"; printf '0x22\n' > "$F/regs/60"
+printf '0x01\n' > "$F/regs/10"                       # alarm2 latch set, stop still 30 s ahead: stale from an earlier cycle
+set_uptime "$F" 5000
+run_sched "$F"
+assert_eq "0" "$RUN_RC" "exits 0"
+assert_not_contains "$RUN_OUT" 'keeping' "a latched stop is not kept"
+# Not kept and inside the lead, so the stop moves a cycle — and the wake with
+# it, which is why alarm1 is rewritten too.
+assert_eq "27 28 29 30 39 32 33 34 35 40 " "$(set_seq "$F")" "both alarms rewritten for the next cycle"
+assert_contains "$RUN_OUT" 'armed register-32 alarm for day 13 at 23:18:00 UTC' "the next cycle's stop"
+fixture_rm "$F"
+
+describe "E1: the stop fired 5 s ago (latch 10 set, registers still hold it) — stand down, exit 69, nothing written"
+F=$(sched_armed_fixture)
+printf '0x05\n' > "$F/regs/58"; printf '0x41\n' > "$F/regs/59"; printf '0x22\n' > "$F/regs/60"   # RTC 22:41:05
+printf '0x01\n' > "$F/regs/10"
+set_uptime "$F" 5000
+run_sched "$F"
+assert_eq "69" "$RUN_RC" "exit 69 — stood down"
+assert_contains "$RUN_OUT" "stop (22:41:00 UTC) fired 5s ago and a power-off is under way" "names the fired stop"
+assert_eq "" "$(set_seq "$F")" "nothing written"
+assert_eq "" "$(stub_log "$F" notify)" "nothing paged"
+fixture_rm "$F"
+
+describe "E1 is bounded: a stop that fired 180 s ago with the node still up is re-armed for the next cycle"
+F=$(sched_armed_fixture)
+printf '0x00\n' > "$F/regs/58"; printf '0x44\n' > "$F/regs/59"; printf '0x22\n' > "$F/regs/60"   # RTC 22:44:00
+printf '0x01\n' > "$F/regs/10"
+set_uptime "$F" 5000
+run_sched "$F"
+assert_eq "0" "$RUN_RC" "exits 0"
+assert_not_contains "$RUN_OUT" 'standing down' "not a stand-down"
+assert_contains "$RUN_OUT" 'armed register-32 alarm for day 13 at 23:18:00 UTC' "the next cycle's stop is armed"
+assert_contains "$(set_seq "$F")" "32 33 34 35 40" "written"
+fixture_rm "$F"
+
+describe "a halt marker at start: stand down before the bus is touched — exit 69, no reads, no writes"
+F=$(sched_fixture)
+sched_marker "$F"
+run_sched "$F"
+assert_eq "69" "$RUN_RC" "exit 69"
+assert_contains "$RUN_OUT" 'standing down' "says so"
+assert_contains "$RUN_OUT" 'halt marker' "and why"
+assert_eq "" "$(set_seq "$F")" "nothing written"
+assert_file_absent "$F/log/i2cget" "nothing read either — the probe comes after the marker check"
+fixture_rm "$F"
+
+describe "a marker that appears between the two alarms: the wake is armed and left, alarm2 is not touched, exit 69"
+F=$(sched_fixture)
+mv "$F/bin/i2cset" "$F/bin/i2cset.real"
+{
+    printf '#!/bin/sh\n'
+    printf '"%s/bin/i2cset.real" "$@"; rc=$?\n' "$F"
+    printf '[ "$4" = 30 ] && mkdir -p "%s/run" && printf "source=daemon\\nuptime=%s\\nreason=2\\nstate=requested\\na1=\\na2=\\n" > "%s/run/halt-requested"\n' "$F" "$(cut -d. -f1 /proc/uptime)" "$F"
+    printf 'exit $rc\n'
+} > "$F/bin/i2cset"; chmod +x "$F/bin/i2cset"
+run_sched "$F"
+assert_eq "69" "$RUN_RC" "exit 69"
+assert_eq "27 28 29 30 39 " "$(set_seq "$F")" "alarm1 complete, its flag cleared, then NOTHING for alarm2"
+assert_contains "$RUN_OUT" 'armed register-27 alarm' "the wake landed"
+assert_contains "$RUN_OUT" "alarm2 is the pre-arm's" "and alarm2 is named as the pre-arm's"
+fixture_rm "$F"
+
+describe "a stale marker (over 120 s old) does not stand the scheduler down"
+F=$(sched_fixture)
+mkdir -p "$F/run"; printf 'source=daemon\nuptime=1\nreason=2\nstate=requested\na1=\na2=\n' > "$F/run/halt-requested"
+run_sched "$F"
+assert_eq "0" "$RUN_RC" "exits 0"
+assert_contains "$RUN_OUT" 'stale' "the marker is called stale"
+assert_contains "$(set_seq "$F")" "27 28 29 30 39 32 33 34 35 40" "and the schedule is applied"
+assert_file_absent "$F/run/halt-requested" "the stale marker is removed"
+fixture_rm "$F"

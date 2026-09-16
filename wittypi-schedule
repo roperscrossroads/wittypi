@@ -24,13 +24,25 @@
 # to bring it back needs a site visit); if alarm2 fails after alarm1 landed,
 # the node wakes on schedule and merely fails to self-stop.
 #
-# Overwriting unconditionally is the design, not a hazard. A fired alarm
-# stays latched in its registers and reads as "armed" to every tool
-# (wake-guard's conservatism exists because it has no idea what the intended
-# schedule is). This script IS reading the source of truth, so overwriting is
-# applying policy — the same relationship `wittypi configure` has with the
-# EEPROM. wake-guard remains the backstop for every path that does not come
-# through here.
+# Overwriting is the design, not a hazard — but only where the registers
+# differ. A fired alarm stays latched in its registers and reads as "armed"
+# to every tool (wake-guard's conservatism exists because it has no idea what
+# the intended schedule is). This script IS reading the source of truth, so
+# overwriting is applying policy — the same relationship `wittypi configure`
+# has with the EEPROM. An alarm whose four registers already hold the
+# computed instant, with its triggered latch clear, is left alone: a rerun
+# near the stop then writes nothing, and a stop this close is never moved
+# out a cycle by the floor below (audit D10). wake-guard remains the backstop
+# for every path that does not come through here.
+#
+# Three stand-downs, exit 69, nothing written (audit H2, E1, D4):
+#   * the halt marker exists when this starts — a power-off is under way and
+#     the daemon's pre-arm owns alarm2 now;
+#   * this window's stop has just fired — latch 10 set, registers 32-35 still
+#     holding it, under 120 s ago — which is the same power-off seen from the
+#     firmware, for the moment before the marker exists;
+#   * the marker appears between the two alarms — the wake is armed and left
+#     armed; alarm2 is the pre-arm's.
 #
 # Anchored on the controller's RTC, never on date -u +%s. The ATtiny
 # compares the alarm registers against ITS OWN clock once a second, inside a
@@ -128,6 +140,16 @@ sched_page() {
 if [ ! -r "$WP_SCHED_ENV" ]; then
     wp_log "schedule: $WP_SCHED_ENV absent — hand-scheduled mode, nothing to renew"
     exit 0
+fi
+
+# ── Stand down under a halt marker, before touching the bus ────────────────
+# The unit's ExecCondition catches this for a systemd start; this catches a
+# typed run, and a start that was already past the condition when the daemon
+# wrote the marker. A power-off is under way: its pre-arm writes the next
+# window's stop, and a scheduler run now would race it for the same registers.
+if wp_halt_requested; then
+    wp_log "schedule: standing down — a power-off is under way (halt marker); the pre-arm owns alarm2 now, nothing written"
+    exit "$WP_EX_STANDDOWN"
 fi
 
 # ── OPTED IN: the controller must answer, and one miss is not an answer ─────
@@ -254,6 +276,37 @@ wp_sched_now_s=$(date -u -d "$wp_sched_now" +%s 2>/dev/null)
 # Boot latency no longer walks the schedule forward a little on every cycle.
 wp_sched_stop=$(( wp_sched_now_s - (wp_sched_now_s % wp_sched_cycle) + wp_sched_on ))
 
+# ── What the registers hold now: the same instant, or a fired one? ─────────
+# sched_alarm_holds <base> <epoch>: the four registers of that alarm hold
+# exactly this instant. Rendered the way wp_arm_alarm writes it, so the
+# comparison is against the bytes a write would produce.
+sched_alarm_holds() {
+    _sah_d=$(date -u -d "@$2" '+%d' 2>/dev/null || date -u -r "$2" '+%d' 2>/dev/null)
+    _sah_h=$(date -u -d "@$2" '+%H' 2>/dev/null || date -u -r "$2" '+%H' 2>/dev/null)
+    _sah_m=$(date -u -d "@$2" '+%M' 2>/dev/null || date -u -r "$2" '+%M' 2>/dev/null)
+    _sah_s=$(date -u -d "@$2" '+%S' 2>/dev/null || date -u -r "$2" '+%S' 2>/dev/null)
+    [ -n "$_sah_d$_sah_h$_sah_m$_sah_s" ] || return 1
+    [ "$(wp_get_maybe_stable "$1")" = "$(( 0x$_sah_s ))" ] || return 1
+    [ "$(wp_get_maybe_stable $(( $1 + 1 )))" = "$(( 0x$_sah_m ))" ] || return 1
+    [ "$(wp_get_maybe_stable $(( $1 + 2 )))" = "$(( 0x$_sah_h ))" ] || return 1
+    [ "$(wp_get_maybe_stable $(( $1 + 3 )))" = "$(( 0x$_sah_d ))" ] || return 1
+}
+wp_sched_a2_latch=$(wp_get_maybe_stable "$WP_REG_ALARM2_TRIGGERED") || wp_sched_a2_latch='?'
+wp_sched_a1_latch=$(wp_get_maybe_stable "$WP_REG_ALARM1_TRIGGERED") || wp_sched_a1_latch='?'
+
+# E1: this window's stop has just fired. Latch 10 is set, registers 32-35
+# still hold the stop, and it was under WP_HALT_STALE_SEC ago: the controller
+# has asked for the power-off and the daemon is on its way to the marker.
+# Re-arming now would write over the appointment the pre-arm is about to
+# replace, and push a wake that is already right. Stand down.
+if [ "$wp_sched_a2_latch" = 1 ] && [ "$wp_sched_now_s" -ge "$wp_sched_stop" ] \
+   && [ $(( wp_sched_now_s - wp_sched_stop )) -lt "$WP_HALT_STALE_SEC" ] \
+   && sched_alarm_holds "$WP_REG_ALARM2_SEC" "$wp_sched_stop"; then
+    wp_unlock
+    wp_log "schedule: this window's stop ($(date -u -d "@$wp_sched_stop" '+%H:%M:%S' 2>/dev/null) UTC) fired $(( wp_sched_now_s - wp_sched_stop ))s ago and a power-off is under way — standing down, nothing written"
+    exit "$WP_EX_STANDDOWN"
+fi
+
 # Never stop before this boot's mark-good can land. Bound 1 above proves a
 # WHOLE window clears T_MARKGOOD; it cannot prove the REMAINDER of one does.
 # Two ways to land mid-window: an off-phase boot (a plug-in, the button,
@@ -293,10 +346,23 @@ wp_sched_mgfloor=$(( wp_sched_now_s - wp_sched_up + wp_sched_mg + 60 ))
 # looped: this is arithmetic on a value an unreadable clock could in
 # principle make absurd, and a `while` here would be an unbounded loop on
 # the one path that must never hang.
+#
+# D10, first: a stop that is ARMED, unfired and still ahead is kept even
+# inside the 60 s lead — the lead exists so a write can land before the
+# moment, and no write is needed. Moving it out would leave the node awake
+# through a whole window because a repair ran near the stop. The mark-good
+# floor still holds: an armed stop this boot cannot survive is moved.
+wp_sched_keep=0
 if [ "$wp_sched_stop" -lt "$wp_sched_earliest" ]; then
-    wp_sched_skip=$(( (wp_sched_earliest - wp_sched_stop + wp_sched_cycle - 1) / wp_sched_cycle ))
-    wp_sched_stop=$(( wp_sched_stop + wp_sched_skip * wp_sched_cycle ))
-    wp_log "schedule: this window's stop is already spent or inside the mark-good floor — skipping ${wp_sched_skip} cycle(s) so the appointment can still fire and the slot can be marked good first"
+    if [ "$wp_sched_stop" -gt $(( wp_sched_now_s + 2 )) ] && [ "$wp_sched_stop" -ge "$wp_sched_mgfloor" ] \
+       && [ "$wp_sched_a2_latch" = 0 ] && sched_alarm_holds "$WP_REG_ALARM2_SEC" "$wp_sched_stop"; then
+        wp_sched_keep=1
+        wp_log "schedule: keeping this window's stop at $(date -u -d "@$wp_sched_stop" '+%H:%M:%S' 2>/dev/null) UTC, $(( wp_sched_stop - wp_sched_now_s ))s ahead — armed and unfired; a rerun this close must not move it out a cycle"
+    else
+        wp_sched_skip=$(( (wp_sched_earliest - wp_sched_stop + wp_sched_cycle - 1) / wp_sched_cycle ))
+        wp_sched_stop=$(( wp_sched_stop + wp_sched_skip * wp_sched_cycle ))
+        wp_log "schedule: this window's stop is already spent or inside the mark-good floor — skipping ${wp_sched_skip} cycle(s) so the appointment can still fire and the slot can be marked good first"
+    fi
 fi
 
 wp_sched_wake=$(( wp_sched_stop + wp_sched_off ))
@@ -313,15 +379,28 @@ wp_sched_wake=$(( wp_sched_stop + wp_sched_off ))
 [ "$wp_sched_wake" -gt "$wp_sched_stop" ] || \
     refuse "computed a wake at or before the shutdown (wake $wp_sched_wake, stop $wp_sched_stop) — refusing to arm a pair that would leave the node with no way back"
 
-# ── alarm1 FIRST — always ──────────────────────────────────────────────────
-if ! wp_arm_alarm "$WP_REG_ALARM1_SEC" "$wp_sched_wake"; then
+# ── alarm1 FIRST — always — and only if it does not already hold the wake ──
+if [ "$wp_sched_a1_latch" = 0 ] && sched_alarm_holds "$WP_REG_ALARM1_SEC" "$wp_sched_wake"; then
+    wp_log "schedule: alarm1 already holds the wake ($(date -u -d "@$wp_sched_wake" '+day %d at %H:%M:%S' 2>/dev/null) UTC), unfired — not rewritten"
+elif ! wp_arm_alarm "$WP_REG_ALARM1_SEC" "$wp_sched_wake"; then
     wp_unlock
     wp_log_err "schedule: could NOT arm the wake (alarm1) — alarm2 deliberately untouched; the node stays up rather than scheduling a shutdown with no way back"
     sched_page "scheduler could not arm the wake alarm — node left up, schedule NOT applied"
     exit 1
 fi
 
-if ! wp_arm_alarm "$WP_REG_ALARM2_SEC" "$wp_sched_stop"; then
+# The marker can appear between the two alarms: the daemon has the request
+# and its pre-arm is about to write alarm2 itself. The wake above is armed
+# and stays; this run does not touch alarm2 (audit D4).
+if wp_halt_requested; then
+    wp_unlock
+    wp_log "schedule: a power-off was requested while arming — the wake is armed and left; alarm2 is the pre-arm's, standing down"
+    exit "$WP_EX_STANDDOWN"
+fi
+
+if [ "$wp_sched_keep" = 1 ] || { [ "$wp_sched_a2_latch" = 0 ] && sched_alarm_holds "$WP_REG_ALARM2_SEC" "$wp_sched_stop"; }; then
+    wp_log "schedule: alarm2 already holds the stop ($(date -u -d "@$wp_sched_stop" '+day %d at %H:%M:%S' 2>/dev/null) UTC), unfired — not rewritten"
+elif ! wp_arm_alarm "$WP_REG_ALARM2_SEC" "$wp_sched_stop"; then
     wp_unlock
     wp_log_err "schedule: wake armed but the shutdown (alarm2) could not be — the node will wake on schedule and simply not self-stop this cycle"
     sched_page "scheduler armed the wake but not the shutdown — node will not self-stop this cycle"
