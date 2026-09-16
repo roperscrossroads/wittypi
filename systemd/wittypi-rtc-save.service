@@ -71,6 +71,15 @@ ExecStart=/usr/bin/wittypi rtc-write
 # holds a time nobody should trust, or was never written, and both must show
 # in `systemctl status`.
 SuccessExitStatus=0 1 69
+# ⚠️ TERM reaches the tool alone. The default KillMode=control-group sends
+# TERM to every process in the unit, and this tool's register reads are child
+# i2cget processes in command substitutions: a stop then kills the read-back of
+# a write that has already landed, and the tool reports a failed write that
+# in fact succeeded (seen on node-02, 2026-09-16, WITTYPI-ACCESS-AUDIT.md §K
+# B8). With mixed, the tool notes TERM, finishes its writes and the read-back,
+# and exits 143; the children are only KILLed with everything else after
+# TimeoutStopSec.
+KillMode=mixed
 
 # ── No [Install]: this is triggered, not enabled ────────────────────────────
 # wittypi-rtc-save.path is what pulls this in, when the sync file appears. If

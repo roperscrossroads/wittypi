@@ -79,6 +79,15 @@ ExecStart=/usr/bin/wittypi configure
 # 75 (the lock could not be taken) or 69 (a power-off was under way): the
 # policy was not applied, and that must show too.
 SuccessExitStatus=0 1
+# ⚠️ TERM reaches the tool alone. The default KillMode=control-group sends
+# TERM to every process in the unit, and this tool's register reads are child
+# i2cget processes in command substitutions: a stop then kills the read-back of
+# a write that has already landed, and the tool reports a failed write that
+# in fact succeeded (seen on node-02, 2026-09-16, WITTYPI-ACCESS-AUDIT.md §K
+# B8). With mixed, the tool notes TERM, finishes its writes and the read-back,
+# and exits 143; the children are only KILLed with everything else after
+# TimeoutStopSec.
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target

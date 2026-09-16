@@ -58,6 +58,18 @@ for n in wittypi-clock.service wittypi-configure.service; do
     assert_not_contains " $(unit_body $n | sed -n 's/^SuccessExitStatus=//p') " " 69 " "$n does not list 69"
 done
 
+describe "the three units that WRITE deliver TERM to the tool alone (KillMode=mixed) — the read-back must not be killed"
+# B8 on node-02 (2026-09-16): under control-group, a stop TERMed the i2cget
+# children too, the read-back read empty, and a landed write was reported as
+# failed. The clock unit only reads and the watch is read-only: neither needs it.
+for u in wittypi-rtc-save wittypi-configure wittypi-schedule; do
+    if grep -qE '^KillMode=mixed$' "$RPI_SYSTEMD_DIR/$u.service"; then
+        ok "$u.service: KillMode=mixed"
+    else
+        notok "$u.service: KillMode=mixed" "a unit stop would TERM the tool's i2cget children mid-read-back"
+    fi
+done
+
 describe "the clock unit: probe before lock, and a start timeout that covers both"
 u=$(unit_body wittypi-clock.service)
 assert_contains "$u" "Environment=WITTYPI_PROBE_SEC=15" "WITTYPI_PROBE_SEC=15"
