@@ -38,10 +38,14 @@ assert_contains "$body" "ExecStart=/usr/libexec/site/wittypi-schedule" "wittypi-
 assert_not_contains "$body" "flock" "no wrapper (a wrapper plus the in-script lock would wait on itself)"
 assert_contains "$(grep -v '^[[:space:]]*#' "$OPS_UNITS_DIR/wittypi-schedule")" "wp_lock x " \
     "and the script takes the lock itself, exclusive"
-for n in wittypi-schedule.service wittypi-reschedule.service; do
+fi
+describe "the stand-down set: every unit that could write into a halt carries the halt-status condition; rtc-save and clock do not"
+for n in wittypi-schedule.service wittypi-reschedule.service wittypi-configure.service wittypi-watch.service; do
     assert_contains "$(unit_body $n)" "ExecCondition=/usr/bin/wittypi halt-status" "$n stands down while a power-off is under way"
 done
-fi
+for n in wittypi-rtc-save.service wittypi-clock.service wittypi.service; do
+    assert_not_contains "$(unit_body $n)" "ExecCondition=" "$n carries no condition (rtc-save's .path would loop on one; the clock only reads; the daemon writes the marker)"
+done
 
 describe "a lock timeout (75) is a success status on NO unit; a stand-down (69) only where the tool cannot be conditioned"
 for u in "$RPI_SYSTEMD_DIR"/*.service; do

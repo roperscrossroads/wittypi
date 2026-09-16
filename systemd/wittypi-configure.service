@@ -67,6 +67,10 @@ EnvironmentFile=-/run/wittypi/policy.env
 # kernel drops it when the fd closes. The 20 s wait is the writers' class;
 # this competes with nothing else at boot and is not on the shutdown clock.
 # A TERM mid-table finishes the register in hand, verified, then exits 143.
+# A power-off under way: stand down (WITTYPI-ACCESS-AUDIT.md §H2). The keeper
+# restarts this unit to repair register 49; a restart into a halt would write
+# the whole table across the pre-arm. No I2C, no lock.
+ExecCondition=/usr/bin/wittypi halt-status
 ExecStart=/usr/bin/wittypi configure
 
 # Exit 1 is how the tool reports "no controller on the bus", which is a
