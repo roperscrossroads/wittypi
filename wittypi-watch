@@ -7,8 +7,8 @@
 # It writes no register, and that rule does not bend. A supervisor that heals
 # by writing is a second writer with all of a writer's failure modes, and the
 # reason the I2C-locking design stays simple is that this stays a pure reader
-# — it takes no lock (see below) precisely because it cannot corrupt anything
-# by being interrupted.
+# — it takes the lock SHARED, section by section (see below), and never
+# exclusive.
 #
 # But it does not only talk, either. Detect-and-page alone means a page about
 # a days-old broken appointment and nothing else, for a state that one
@@ -22,9 +22,13 @@
 # That is a request, not a write. The owning unit keeps the lock, the TERM
 # trap, the read-back and the refusals; this script keeps its single
 # responsibility and its 1s TimeoutStopSec. Repair is bounded (three
-# attempts per boot), gated on a trustworthy clock, and switchable off with
-# WITTYPI_WATCH_REPAIR=0. The verdict is always read back from the registers
-# on a LATER tick — never assumed from the fact that a request was made.
+# attempts per boot, ONE per tick — two --no-block requests in one tick race
+# each other for the lock, audit D2), gated on a trustworthy clock, never
+# made while a power-off is under way, and switchable off: WITTYPI_WATCH_REPAIR=0
+# for all of it, WITTYPI_WATCH_REPAIR_SCHEDULE=0 to leave schedule repairs to
+# a keeper that owns them (csramsh nodes: wake-keeper). The verdict is always
+# read back from the registers on a LATER tick — never assumed from the fact
+# that a request was made.
 #
 # The prerequisite is that the scheduler is idempotent. Re-running it is only
 # safe because it anchors appointments on absolute cycle phase; a scheduler
@@ -74,13 +78,19 @@
 # milliseconds with nothing to clean up. A trap here would be budget spent on
 # the shutdown path for a script with no state to protect.
 #
-# No I2C lock, deliberately. A flock -w wrap here would HOLD the lock for the
-# whole run, and a shutdown racing a tick would find wake-guard's `ensure` —
-# 1 s wait, gives up rather than blocks — timing out against a supervisor,
-# arming NOTHING. The reader must never be able to starve the one writer that
-# matters. Ordering (the unit's stop-before relationship), not locking, is
-# what serialises the shutdown coincidence; mid-tick reads torn by some OTHER
-# accessor cost at worst a wrong log line this tick.
+# The I2C lock, SHARED and per section, never for the whole run. A lock held
+# across the tick would have a shutdown racing it find wake-guard's `ensure`
+# — 2 s wait, gives up rather than blocks — timing out against a supervisor,
+# arming NOTHING. So each multi-register section (the RTC read, the schedule's
+# alarm pair) takes `wp_lock s 2`, reads, and releases before it decides,
+# pages or asks a unit to run; the single-register reads of check 1 are
+# atomic in the kernel and stay unlocked (that read is the controller-death
+# detector, and must not be confused with a busy bus). A section whose lock
+# cannot be had in 2 s is SKIPPED and said so, and the tick exits 75 — never
+# a hazard, never a page: a busy bus is another accessor doing its job.
+# The stand-down: a halt marker (`wittypi halt-status`, the unit's
+# ExecCondition, and checked again here for a typed run) means a power-off is
+# under way — exit 69, no reads, no repairs.
 #
 # Overridable paths mirror wake-guard's own test seams (WAKE_GUARD_ENV,
 # WAKE_GUARD_WITTYPI, WAKE_GUARD_LOCK): the offline suite points these into
@@ -96,13 +106,13 @@ WP_WATCH_SCHEDULE="${WITTYPI_WATCH_SCHEDULE:-/data/wittypi-schedule.env}"
 # ── THE REPAIR SEAM ────────────────────────────────────────────────────────
 # The watch still writes no register. The header's rule stands, and this does
 # not bend it: repair means asking the unit that already owns the write to
-# run. wittypi-schedule holds the I2C lock through its unit's flock wrap,
+# run. wittypi-schedule takes the I2C lock itself, exclusive,
 # carries the TERM trap that makes a half-written alarm impossible, and
 # enforces both schedule bounds; wittypi-rtc-save verifies every field it
 # writes. Reimplementing either here would be a second writer with all of a
 # writer's failure modes — which is exactly what the header forbids. Handing
 # the job to the existing writer costs one systemctl call and keeps this
-# script a pure reader that has never taken the lock.
+# script a pure reader; the request is made with the lock released.
 # Absolute, and /usr/bin — the same path wittypi-shutdown-gate uses. Not the
 # bare name: where the gate is installed, /usr/sbin/{poweroff,halt,shutdown}
 # are symlinks to it, and a PATH lookup from a script is exactly the ambiguity
@@ -114,6 +124,16 @@ WP_WATCH_UPTIME="${PROC_UPTIME:-/proc/uptime}"
 # returnable to log-and-page with one line in /data/wittypi.env, not a
 # reflash.
 WP_WATCH_REPAIR="${WITTYPI_WATCH_REPAIR:-1}"
+# Schedule repairs may belong to someone else. A node with a keeper that
+# checks the alarm pair and register 49 every few minutes (csramsh nodes:
+# wake-keeper) sets this 0 in its unit drop-in; the watch then only reports
+# what it sees of the schedule, and pages only for the one finding a keeper
+# cannot undo — a node that was awake through its own stop.
+WP_WATCH_REPAIR_SCHEDULE="${WITTYPI_WATCH_REPAIR_SCHEDULE:-1}"
+# Per-section shared-lock wait. 2 s: the writers hold the lock for one arm
+# (~1.2 s) or the configure table (~3 s, at boot only); a longer wait here
+# only delays a reader.
+WP_WATCH_LOCK_WAIT="${WITTYPI_WATCH_LOCK_WAIT:-2}"
 
 # Bounded, and the counter lives in /run so it resets every boot. A
 # condition the scheduler cannot fix is not made fixable by asking again
@@ -141,6 +161,20 @@ WP_WATCH_RTC_SLOP="${WITTYPI_WATCH_RTC_SLOP:-300}"
 # shellcheck source=/dev/null
 . "$WP_WATCH_LIB" || exit 1
 
+# ── Stand down while a power-off is under way ──────────────────────────────
+# The unit's ExecCondition catches a systemd start; this catches a typed run
+# and a start already past the condition when the daemon wrote the marker.
+if wp_halt_requested; then
+    wp_log "watch: standing down — a power-off is under way (halt marker); nothing read, nothing requested"
+    exit "$WP_EX_STANDDOWN"
+fi
+# Sections skipped because the lock was busy; 75 at the end if any.
+WP_WATCH_BUSY=0
+wp_watch_busy() {
+    WP_WATCH_BUSY=$(( WP_WATCH_BUSY + 1 ))
+    wp_log "watch: $1 skipped — the I2C lock was busy for ${WP_WATCH_LOCK_WAIT}s (another accessor holds it); not a hazard, this tick exits 75"
+}
+
 # The "no controller" gate sits BELOW the hazard helpers rather than here,
 # because on a node with a schedule configured an unanswering controller is a
 # hazard rather than a bench configuration, and reporting that needs
@@ -166,7 +200,7 @@ wp_watch_hazard() {
         >> "$WP_WATCH_RECORD" 2>/dev/null \
         || wp_log "watch: could not record the hazard to $WP_WATCH_RECORD"
     "$WP_WATCH_NOTIFY" -t "wittypi node hazard" -p high -g warning "$1" \
-        >/dev/null 2>&1 || true
+        >/dev/null 2>&1 9>&- || true
 }
 
 # Set when check 3 finds the RTC disagreeing with a synced system clock and
@@ -183,14 +217,35 @@ WP_WATCH_REARM_FRESH=0
 
 # wp_watch_repair <unit> <what-it-is-for>
 #   0 = the repair was requested, 1 = it was not (disabled, capped, suspect
-#   clock, or systemctl refused). Never blocks and never pages: the caller
-#   decides what the failure to repair MEANS, because that differs per check.
+#   clock, a power-off under way, a second request this tick, or systemctl
+#   refused), 3 = schedule repairs are a keeper's on this node. Never blocks
+#   and never pages: the caller decides what the failure to repair MEANS,
+#   because that differs per check. WP_WATCH_REPAIR_WHY says which.
+WP_WATCH_REPAIRED=0
+WP_WATCH_REPAIR_WHY=''
 wp_watch_repair() {
     if [ "$WP_WATCH_REPAIR" != "1" ]; then
+        WP_WATCH_REPAIR_WHY='repair disabled'
         wp_log "watch: repair disabled (WITTYPI_WATCH_REPAIR=$WP_WATCH_REPAIR) — $2 left for a human"
         return 1
     fi
+    if [ "$1" = wittypi-schedule.service ] && [ "$WP_WATCH_REPAIR_SCHEDULE" != "1" ]; then
+        WP_WATCH_REPAIR_WHY="schedule repairs are wake-keeper's on this node"
+        wp_log "watch: $2 — schedule repairs belong to wake-keeper on this node (WITTYPI_WATCH_REPAIR_SCHEDULE=$WP_WATCH_REPAIR_SCHEDULE); not requesting"
+        return 3
+    fi
+    if [ "$WP_WATCH_REPAIRED" = 1 ]; then
+        WP_WATCH_REPAIR_WHY='deferred to the next tick (one repair per tick)'
+        wp_log "watch: one repair per tick — $2 waits for the next tick, so two --no-block requests never race for the lock"
+        return 1
+    fi
+    if wp_halt_requested; then
+        WP_WATCH_REPAIR_WHY='a power-off is under way'
+        wp_log "watch: NOT repairing $2 — a power-off is under way (halt marker); nothing is restarted into a shutdown"
+        return 1
+    fi
     if [ "$WP_WATCH_RTC_SUSPECT" != "0" ]; then
+        WP_WATCH_REPAIR_WHY='the RTC is under suspicion'
         wp_log "watch: NOT repairing $2 — the RTC is under suspicion this tick, and an appointment computed from a clock we do not trust is an armed miss"
         return 1
     fi
@@ -198,6 +253,7 @@ wp_watch_repair() {
     wp_watch_rn=$(cat "$WP_WATCH_REPAIR_STATE" 2>/dev/null)
     case "$wp_watch_rn" in ''|*[!0-9]*) wp_watch_rn=0 ;; esac
     if [ "$wp_watch_rn" -ge "$WP_WATCH_REPAIR_MAX" ]; then
+        WP_WATCH_REPAIR_WHY="$WP_WATCH_REPAIR_MAX attempts already made this boot"
         wp_log "watch: $WP_WATCH_REPAIR_MAX repair attempts already made this boot — not asking again"
         return 1
     fi
@@ -216,10 +272,12 @@ wp_watch_repair() {
     # the request is fired and the VERDICT IS READ ON THE NEXT TICK, fifteen
     # minutes later, from the registers themselves. The attempt counter is
     # what makes that loop terminate.
-    if "$WP_WATCH_SYSTEMCTL" restart --no-block "$1" >/dev/null 2>&1; then
+    if "$WP_WATCH_SYSTEMCTL" restart --no-block "$1" >/dev/null 2>&1 9>&-; then
+        WP_WATCH_REPAIRED=1
         wp_log "watch: REPAIRING $2 — asked $1 to re-run (attempt $(( wp_watch_rn + 1 ))/$WP_WATCH_REPAIR_MAX); the next tick reads the registers to confirm"
         return 0
     fi
+    WP_WATCH_REPAIR_WHY='systemctl refused'
     wp_log "watch: could not ask $1 to re-run — $2 not repaired"
     return 1
 }
@@ -327,9 +385,12 @@ fi   # wp_watch_alarm_checked
 # ── 3. RTC plausibility ────────────────────────────────────────────────────
 if [ ! -e "$WP_WATCH_SYNCED" ]; then
     wp_log "watch: clock not NTP-synced — skipping RTC plausibility"
+elif ! wp_lock s "$WP_WATCH_LOCK_WAIT" "wittypi-watch rtc"; then
+    wp_watch_busy "the RTC plausibility check"
 else
     wp_watch_t=$(wp_rtc_read_confirmed)
     wp_watch_rtc_rc=$?
+    wp_unlock
     if [ "$wp_watch_rtc_rc" = 0 ]; then
         wp_watch_rtc_s=$(date -u -d "$wp_watch_t" +%s 2>/dev/null)
         wp_watch_now_s=$(date -u +%s)
@@ -433,18 +494,36 @@ if [ -r "$WP_WATCH_SCHEDULE" ]; then
         wp_watch_repair wittypi-schedule.service "alarms armed against a clock that has since been corrected" || true
     fi
 
-    wp_watch_alarm 32
-    case $? in
-        1) wp_log "watch: alarm2 unreadable this tick — schedule check skipped; check 1 is the controller-death detector" ;;
-        2) if wp_watch_repair wittypi-schedule.service "alarm2 holding no appointment"; then
-               wp_log "watch: a schedule is configured but alarm2 holds NO shutdown appointment — repair requested, verdict next tick"
-           else
-               wp_watch_hazard "a schedule is configured but alarm2 holds NO shutdown appointment — the node will not stop itself, and the scheduler could not be re-run; check wittypi-schedule.service"
-           fi ;;
-        0)
-            wp_watch_sched_desc=$wp_watch_a_desc
-            wp_watch_sched_ts=$wp_watch_a_ts
+    # The reads — alarm2, the RTC, alarm1 — under ONE shared lock, released
+    # before anything below decides, pages or asks a unit to run.
+    if ! wp_lock s "$WP_WATCH_LOCK_WAIT" "wittypi-watch schedule"; then
+        wp_watch_busy "the schedule-appointment check"
+        wp_watch_a2_rc=busy
+    else
+        wp_watch_alarm 32; wp_watch_a2_rc=$?
+        wp_watch_sched_desc=$wp_watch_a_desc
+        wp_watch_sched_ts=$wp_watch_a_ts
+        wp_watch_sn=''
+        wp_watch_a1_rc=1
+        if [ "$wp_watch_a2_rc" = 0 ]; then
             wp_watch_sn=$(wp_rtc_read_confirmed) || wp_watch_sn=''
+            wp_watch_alarm 27; wp_watch_a1_rc=$?
+            wp_watch_a1_desc=$wp_watch_a_desc
+            wp_watch_a1_ts=$wp_watch_a_ts
+        fi
+        wp_unlock
+    fi
+
+    case $wp_watch_a2_rc in
+        busy) ;;
+        1) wp_log "watch: alarm2 unreadable this tick — schedule check skipped; check 1 is the controller-death detector" ;;
+        2) wp_watch_repair wittypi-schedule.service "alarm2 holding no appointment"
+           case $? in
+               0) wp_log "watch: a schedule is configured but alarm2 holds NO shutdown appointment — repair requested, verdict next tick" ;;
+               3) wp_log "watch: a schedule is configured but alarm2 holds NO shutdown appointment — wake-keeper owns that repair on this node" ;;
+               *) wp_watch_hazard "a schedule is configured but alarm2 holds NO shutdown appointment — the node will not stop itself, and the scheduler could not be re-run ($WP_WATCH_REPAIR_WHY); check wittypi-schedule.service" ;;
+           esac ;;
+        0)
             if [ -z "$wp_watch_sn" ]; then
                 wp_log "watch: RTC unreadable — schedule-appointment check skipped"
             else
@@ -484,24 +563,28 @@ if [ -r "$WP_WATCH_SCHEDULE" ]; then
                     # it is the difference between a page that means something
                     # and one that teaches you to swipe alerts away.
                     wp_watch_up=$(wp_watch_uptime) || wp_watch_up=''
-                    wp_watch_fixed=0
-                    wp_watch_repair wittypi-schedule.service \
-                        "alarm2 ${wp_watch_over}s past-dated" && wp_watch_fixed=1
+                    wp_watch_repair wittypi-schedule.service "alarm2 ${wp_watch_over}s past-dated"
+                    wp_watch_fixed=$?
 
                     if [ -n "$wp_watch_up" ] && [ "$wp_watch_up" -lt "$wp_watch_over" ]; then
-                        if [ "$wp_watch_fixed" = 1 ]; then
-                            wp_log "watch: alarm2 ($wp_watch_sched_desc) is ${wp_watch_over}s past-dated, but this node has only been up ${wp_watch_up}s — it was OFF when that moment passed, so this is a stale leftover rather than a missed shutdown. Re-arm requested; verdict next tick"
-                        else
-                            wp_watch_hazard "alarm2 ($wp_watch_sched_desc) is a stale leftover from before this boot (up ${wp_watch_up}s, overdue ${wp_watch_over}s) and the scheduler could not be re-run — the node has no shutdown appointment; check wittypi-schedule.service"
-                        fi
+                        case $wp_watch_fixed in
+                            0) wp_log "watch: alarm2 ($wp_watch_sched_desc) is ${wp_watch_over}s past-dated, but this node has only been up ${wp_watch_up}s — it was OFF when that moment passed, so this is a stale leftover rather than a missed shutdown. Re-arm requested; verdict next tick" ;;
+                            3) wp_log "watch: alarm2 ($wp_watch_sched_desc) is ${wp_watch_over}s past-dated, but this node has only been up ${wp_watch_up}s — a stale leftover from before this boot; wake-keeper owns its repair on this node" ;;
+                            *) wp_watch_hazard "alarm2 ($wp_watch_sched_desc) is a stale leftover from before this boot (up ${wp_watch_up}s, overdue ${wp_watch_over}s) and the scheduler could not be re-run ($WP_WATCH_REPAIR_WHY) — the node has no shutdown appointment; check wittypi-schedule.service" ;;
+                        esac
                     else
                         # Awake through it, or uptime unreadable and we must
                         # assume the worse of the two. Page EVEN IF the repair
-                        # was requested: the node has already been awake past
-                        # its window on a budget that assumed it would not be,
-                        # and that is worth knowing about whether or not the
-                        # next tick fixes it.
-                        wp_watch_hazard "a schedule is configured but alarm2 ($wp_watch_sched_desc) is ${wp_watch_over}s in the PAST and this node was AWAKE through it (up ${wp_watch_up:-unknown}s) — the scheduled shutdown did NOT happen and nothing in this design stops a node that stays up$([ "$wp_watch_fixed" = 1 ] && printf '; re-arm requested' || printf '; re-arm NOT possible')"
+                        # was requested, or is a keeper's: the node has already
+                        # been awake past its window on a budget that assumed
+                        # it would not be, and that is worth knowing about
+                        # whether or not the next tick fixes it.
+                        case $wp_watch_fixed in
+                            0) wp_watch_rearm='; re-arm requested' ;;
+                            3) wp_watch_rearm="; re-arm is wake-keeper's on this node" ;;
+                            *) wp_watch_rearm="; re-arm NOT requested ($WP_WATCH_REPAIR_WHY)" ;;
+                        esac
+                        wp_watch_hazard "a schedule is configured but alarm2 ($wp_watch_sched_desc) is ${wp_watch_over}s in the PAST and this node was AWAKE through it (up ${wp_watch_up:-unknown}s) — the scheduled shutdown did NOT happen and nothing in this design stops a node that stays up$wp_watch_rearm"
                     fi
                 else
                     wp_log "watch: alarm2 armed for $wp_watch_sched_desc"
@@ -511,10 +594,10 @@ if [ -r "$WP_WATCH_SCHEDULE" ]; then
                 # power-off (reason 8). If it is the wake that started this
                 # boot, nothing re-fires it: the scheduler renews it at boot,
                 # and wake-guard arms a fallback at shutdown.
-                if wp_watch_alarm 27; then
-                    wp_watch_over1=$(( wp_watch_sn_ts - wp_watch_a_ts ))
+                if [ "$wp_watch_a1_rc" = 0 ]; then
+                    wp_watch_over1=$(( wp_watch_sn_ts - wp_watch_a1_ts ))
                     if [ "$wp_watch_over1" -gt 5 ] && [ "$wp_watch_over1" -le 1209600 ]; then
-                        wp_log "watch: alarm1 ($wp_watch_a_desc) is in the past — if it came due while up the MCU re-fires it ~4s after the next power-off; otherwise the scheduler renews it and wake-guard arms a fallback at shutdown"
+                        wp_log "watch: alarm1 ($wp_watch_a1_desc) is in the past — if it came due while up the MCU re-fires it ~4s after the next power-off; otherwise the scheduler renews it and wake-guard arms a fallback at shutdown"
                     fi
                 fi
             fi
@@ -522,6 +605,10 @@ if [ -r "$WP_WATCH_SCHEDULE" ]; then
     esac
 fi
 
-[ "$WP_WATCH_HAZARDS" -eq 0 ] && exit 0
+if [ "$WP_WATCH_HAZARDS" -eq 0 ]; then
+    [ "$WP_WATCH_BUSY" -eq 0 ] && exit 0
+    wp_log "watch: $WP_WATCH_BUSY section(s) skipped on a busy bus — nothing judged, exit 75"
+    exit "$WP_EX_LOCK"
+fi
 wp_log "watch: $WP_WATCH_HAZARDS hazard(s) this tick — see $WP_WATCH_RECORD"
 exit 1

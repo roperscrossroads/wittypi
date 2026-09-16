@@ -50,7 +50,13 @@ Type=oneshot
 # journal (journalctl -u wittypi-watch) rather than in systemctl status — a
 # small loss, paid for actually ticking. tests/cases/wittypi-watch.sh pins the
 # directive absent.
-TimeoutStartSec=10
+# A halt under way: stand down (WITTYPI-ACCESS-AUDIT.md §H2). No I2C, no lock.
+ExecCondition=/usr/bin/wittypi halt-status
+# Two shared-lock sections at 2 s each, two confirmed RTC reads, a wake-guard
+# check that locks itself, and up to one --no-block repair request: 30 s
+# holds that with room for a slow bus; 10 did not once the reads waited on
+# the lock.
+TimeoutStartSec=30
 
 # 1 s, and it is part of the power-cut budget — the term this unit adds to the
 # shutdown sum in the coincidence case (a shutdown racing a tick: this stop,

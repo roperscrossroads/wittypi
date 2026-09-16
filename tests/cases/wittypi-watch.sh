@@ -108,6 +108,8 @@ run_watch() {
         WITTYPI_WATCH_SYSTEMCTL="$1/bin/systemctl" \
         WITTYPI_WATCH_REPAIR_STATE="$1/repairs" \
         WITTYPI_WATCH_REARM_MARK="$1/rearm" \
+        WITTYPI_LOCK="$1/lock" \
+        WITTYPI_RUN_DIR="$1/run" \
         PROC_UPTIME="$1/proc/uptime" \
         sh "$WATCH" 2>&1
     )
@@ -574,7 +576,9 @@ describe "the supervisor is a pure reader, structurally"
 watch_body=$(grep -v '^\s*#' "$WATCH")
 assert_not_contains "$watch_body" 'i2cset' "never touches i2cset"
 assert_not_contains "$watch_body" 'wp_set' "never calls wp_set"
-assert_not_contains "$watch_body" 'flock' "takes no lock — a reader must never starve ensure's 1s wait"
+assert_not_contains "$watch_body" 'flock' "no flock of its own — the lock goes through the lib"
+assert_not_contains "$watch_body" 'wp_lock x' "never the EXCLUSIVE lock — a reader must never starve ensure's wait"
+assert_eq "2" "$(printf '%s\n' "$watch_body" | grep -c 'wp_lock s ')" "two shared sections: the RTC read and the schedule's alarm pair"
 assert_not_contains "$watch_body" 'trap ' "no traps: SIGTERM must kill it in milliseconds"
 
 describe "the unit's ordering direction — stop-before, so After=, never Before="
@@ -589,7 +593,8 @@ assert_not_contains "$unit_text" '[Install]' "timer-started: enabling it too wou
 
 describe "the unit's budget numbers are the ones the suite accounts for"
 assert_contains "$unit_text" 'TimeoutStopSec=1' "1s stop bound — the fifth budget term"
-assert_contains "$unit_text" 'TimeoutStartSec=10' "a tick is bounded"
+assert_contains "$unit_text" 'TimeoutStartSec=30' "a tick is bounded — 30 s now that two sections wait on the lock"
+assert_contains "$unit_text" 'ExecCondition=/usr/bin/wittypi halt-status' "stands down under a halt (audit A4)"
 assert_not_contains "$unit_text" 'RemainAfterExit' "RemainAfterExit would make OnUnitActiveSec a one-tick-per-boot timer — a blind supervisor"
 assert_contains "$unit_text" 'EnvironmentFile=-/data/wittypi.env' "compares against the same intent configure applies"
 watch_exec=$(grep '^ExecStart=' "$WATCH_UNIT")
@@ -607,3 +612,98 @@ if have "$(dirname "$0")/duty-cycle.sh" "duty-cycle.sh — integration-only, it 
 assert_contains "$(cat "$(dirname "$0")/duty-cycle.sh")" 'wittypi-watch.service' "duty-cycle.sh derives the fifth term from the unit"
 fi
 assert_contains "$(cat "$RPI_DIR/timing-windows")" 'WATCH_SD' "timing-windows carries it too"
+
+# ── W9: stand-down, one repair per tick, the keeper knob, a busy bus ───────
+watch_marker() { mkdir -p "$1/run"; printf 'source=daemon\nuptime=%s\nreason=2\nstate=requested\na1=\na2=\n' "$(cut -d. -f1 /proc/uptime)" > "$1/run/halt-requested"; }
+# The past-dated alarm2 the repair cases use: 21:00:00 on day 13, ~5379 s
+# behind the fixture's RTC.
+watch_stale_alarm2() { seq_set "$1" "0x00" 32; seq_set "$1" "0x00" 33; seq_set "$1" "0x21" 34; seq_set "$1" "0x13" 35; }
+
+describe "a halt marker: the tick stands down — exit 69, nothing read, nothing requested"
+F=$(watch_fixture)
+touch "$F/sched.env"; watch_stale_alarm2 "$F"; set_uptime "$F" 9000
+watch_marker "$F"
+export STUB_NOW=$(( RTC_EPOCH + 5 ))
+run_watch "$F"
+assert_eq "69" "$RUN_RC" "exit 69"
+assert_contains "$RUN_OUT" 'standing down' "says so"
+assert_not_contains "$RUN_OUT" 'guaranteed wake ok' "no check ran"
+assert_eq "" "$(stub_log "$F" systemctl)" "no repair requested into a shutdown"
+assert_eq "" "$(stub_log "$F" notify)" "nothing paged"
+unset STUB_NOW
+fixture_rm "$F"
+
+describe "D2: RTC skew AND a past-dated alarm2 in one tick — exactly ONE request, the re-arm waits a tick"
+# Both repairs are --no-block; asked together they race for the lock and the
+# scheduler can arm from the very clock rtc-save is correcting. The RTC comes
+# first; the schedule request is refused this tick, and the marker check 3
+# leaves brings it next tick.
+F=$(watch_fixture)
+touch "$F/sched.env"; watch_stale_alarm2 "$F"; set_uptime "$F" 9000
+export STUB_NOW=$(( RTC_EPOCH + 43200 ))
+run_watch "$F"
+assert_eq "1" "$RUN_RC" "the missed shutdown is still a hazard"
+assert_eq "1" "$(stub_log "$F" systemctl | wc -l | tr -d ' ')" "one systemctl request in the tick"
+assert_contains "$(stub_log "$F" systemctl)" 'wittypi-rtc-save.service' "and it is the RTC correction"
+assert_contains "$RUN_OUT" 'one repair per tick' "the schedule request is deferred, and says so"
+assert_contains "$RUN_OUT" 're-arm NOT requested (deferred to the next tick' "the hazard names the deferral, not a failure"
+assert_file_exists "$F/rearm" "the deferred re-arm marker is left for the next tick"
+unset STUB_NOW
+fixture_rm "$F"
+
+describe "WITTYPI_WATCH_REPAIR_SCHEDULE=0: alarm2 holding no appointment is the keeper's — log, no request, no page"
+F=$(watch_fixture)
+touch "$F/sched.env"; set_uptime "$F" 9000                # registers 32-35 read 0: no appointment
+export STUB_NOW=$(( RTC_EPOCH + 5 )) WITTYPI_WATCH_REPAIR_SCHEDULE=0
+run_watch "$F"
+assert_eq "0" "$RUN_RC" "not a hazard"
+assert_contains "$RUN_OUT" 'wake-keeper owns that repair' "named as the keeper's"
+assert_eq "" "$(stub_log "$F" systemctl)" "nothing requested"
+assert_eq "" "$(stub_log "$F" notify)" "nothing paged"
+unset STUB_NOW WITTYPI_WATCH_REPAIR_SCHEDULE
+fixture_rm "$F"
+
+describe "...but a node AWAKE through its stop still pages with the knob off — a keeper cannot undo a missed shutdown"
+F=$(watch_fixture)
+touch "$F/sched.env"; watch_stale_alarm2 "$F"; set_uptime "$F" 9000
+export STUB_NOW=$(( RTC_EPOCH + 5 )) WITTYPI_WATCH_REPAIR_SCHEDULE=0
+run_watch "$F"
+assert_eq "1" "$RUN_RC" "a hazard"
+assert_contains "$RUN_OUT" "was AWAKE through it" "the missed shutdown"
+assert_contains "$RUN_OUT" "re-arm is wake-keeper's on this node" "and whose the re-arm is"
+assert_eq "" "$(stub_log "$F" systemctl)" "nothing requested by the watch"
+assert_contains "$(stub_log "$F" notify)" 'PAST' "paged"
+unset STUB_NOW WITTYPI_WATCH_REPAIR_SCHEDULE
+fixture_rm "$F"
+
+describe "the stale leftover with the knob off: logged as the keeper's, no page"
+F=$(watch_fixture)
+touch "$F/sched.env"; watch_stale_alarm2 "$F"; set_uptime "$F" 60
+export STUB_NOW=$(( RTC_EPOCH + 5 )) WITTYPI_WATCH_REPAIR_SCHEDULE=0
+run_watch "$F"
+assert_eq "0" "$RUN_RC" "not a hazard"
+assert_contains "$RUN_OUT" 'wake-keeper owns its repair' "named as the keeper's"
+assert_eq "" "$(stub_log "$F" notify)" "nothing paged"
+unset STUB_NOW WITTYPI_WATCH_REPAIR_SCHEDULE
+fixture_rm "$F"
+
+describe "a busy bus: the locked sections are skipped, exit 75, no hazard, no page, no repair"
+if command -v flock >/dev/null 2>&1; then
+F=$(watch_fixture)
+touch "$F/sched.env"; watch_stale_alarm2 "$F"; set_uptime "$F" 9000
+sh -c 'exec 9>>"$0"; flock -x 9; exec sleep 4' "$F/lock" &
+holder=$!
+sleep 0.3
+export STUB_NOW=$(( RTC_EPOCH + 5 )) WITTYPI_WATCH_LOCK_WAIT=1
+run_watch "$F"
+assert_eq "75" "$RUN_RC" "exit 75"
+assert_eq "2" "$(printf '%s\n' "$RUN_OUT" | grep -c 'the I2C lock was busy')" "both locked sections skipped, each saying so"
+assert_contains "$RUN_OUT" 'guaranteed wake ok' "the unlocked single-register check still ran"
+assert_contains "$RUN_OUT" '2 section(s) skipped on a busy bus' "the summary counts them"
+assert_eq "" "$(stub_log "$F" notify)" "nothing paged — a busy bus is not a hazard"
+assert_eq "" "$(stub_log "$F" systemctl)" "nothing requested"
+assert_file_absent "$F/data/watch-hazards" "no hazard recorded"
+unset STUB_NOW WITTYPI_WATCH_LOCK_WAIT
+wait "$holder" 2>/dev/null
+fixture_rm "$F"
+else printf '    SKIP flock not on this host\n'; fi
