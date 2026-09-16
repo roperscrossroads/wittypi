@@ -33,18 +33,29 @@
 # own input is a report you cannot trust on a machine you are debugging.
 
 # ── MEASURED ───────────────────────────────────────────────────────────────
-# These two describe YOUR IMAGE, not the Witty Pi, and the values below are
-# from a reference setup: a Pi Zero W with a Witty Pi 4, an uncompressed
-# image. They are the right order of magnitude for a small Pi and they are not
-# a fact about your build. Re-measure them on the image you actually ship
-# before trusting the margins computed from them.
+# These three describe YOUR IMAGE, not the Witty Pi. The values below are from
+# the fleet's node image on a classic Pi Zero with a Witty Pi 4 (node-02,
+# board 02), measured on 2026-09-16 across 17 scheduled wakes and 27 shutdowns
+# on the bench: Image 3 of the shutdown contract, its restart-fix image, and a
+# twelve-cycle soak on ON 420 s / OFF 180 s. They are the right order of
+# magnitude for a small Pi and they are not a fact about your build.
+# Re-measure them on the image you actually ship before trusting the margins
+# computed from them.
+#
+# Method, for all three: a read-only serial capture with the workstation's
+# receive time per line (±20 ms), the node's journal in monotonic time, and
+# the alarm times the scheduler logged. Power-on is the armed alarm1 time: the
+# controller checks the alarm at 1 Hz inside a 2 s window, so that anchor is
+# good to about ±1 s, and the spread of the first phase below is that jitter,
+# not the Pi. Each term carries its WORST observation, rounded up.
 
-# Power-on -> the point your image considers "booted".
-# Capture the console from BEFORE a scheduled wake so its first byte is the
-# bootloader banner, then anchor to /proc/stat btime. The reference breakdown:
-# 2.5 s firmware+bootloader, 7.5 s bootloader->kernel, 95.9 s kernel->userspace
-# gate. Measured 105.9, carried as 106.
-T_BOOT=106
+# Power-on -> the point your image considers "booted": the start of the
+# health gate ("Starting Health check gating RAUC mark-good").
+# alarm1 -> U-Boot banner 2.2-4.0 s (VideoCore firmware + U-Boot init),
+# U-Boot -> kernel 0 7.8 s, kernel -> gate 60.9-79.0 s: 71.6-89.3 s over 17
+# wakes. Was 106 on the 2026-08-16 image (2.5 + 7.5 + 95.9): the phases before
+# the kernel are the same, the gate starts 20-30 s earlier.
+T_BOOT=90
 
 # Power-on -> the point your image marks this boot healthy.
 #
@@ -55,33 +66,44 @@ T_BOOT=106
 # simply a conservative lower bound on the awake window.
 #
 # This is NOT T_BOOT plus the health soak. A soak that runs until a fixed
-# uptime SUBSUMES the boot rather than following it; adding the two gives ~400
-# here and is wrong by 90 seconds. Measure from power-on, not from boot.
-T_MARKGOOD=312
+# uptime SUBSUMES the boot rather than following it; adding the two gives ~390
+# here and is wrong by 75 seconds. Measure from power-on, not from boot.
+#
+# The health check soaks until uptime 300 s and its checks then take 1.7-3.4 s,
+# so "Finished RAUC Good-marking Service" lands at 301.7-303.4 s of kernel
+# time; with the 10.0-11.8 s before the kernel that is 312.2-315.2 s from
+# power-on over 17 wakes. Was 312, from one wake measured at 312.2 on
+# 2026-08-16. wittypi-schedule's ON floor is this + 60.
+T_MARKGOOD=316
 
-# Halt request -> the kernel's "reboot: Power down", from a console capture of
-# a real `systemctl poweroff`. In the reference capture: 39.279 s (kernel's
-# "reboot: Power down") minus 31.257 s (first unit-stop message) = 8.022 s,
-# carried as 8.
+# Halt request -> the kernel's "reboot: Power down", from the console: the
+# first unit "Stopping" line to the power-down line.
 #
-# That run includes a FULL wake-guard arm, not its fast recheck. With alarm1
-# cleared beforehand, wake-guard.service's ExecStop takes the slow "nothing
-# armed yet" path — 4.004 s in the same capture, close to its TimeoutStopSec=5
-# ceiling. On the controller-initiated path the daemon's own wake-guard call
-# usually arms first, so the unit's ExecStop hits the fast already-armed
-# recheck (~0.7 s). But a Linux-initiated shutdown — a human typing `poweroff`,
-# or anything reaching wake-guard.service with nothing pre-armed — pays the
-# slow path and nothing else reserves budget for it. That is a real code path,
-# not a contrived worst case, so it is what this constant carries.
+# Measured 2026-09-16 on the shutdown contract (the halt marker, the daemon's
+# pre-arm, the `stop` verb as wake-guard.service's ExecStop), per path:
 #
-# Shutdown mechanics alone, subtracting that arm: 8.022 - 4.018 = ~4 s. Most of
-# the cost is the arming, not the rest of the shutdown.
+#   controller-initiated (alarm2), uncontended    6.04-6.64 s   16 cycles; the
+#     ExecStop verifies the marker's arms in 0.72-1.08 s and writes nothing
+#   typed `poweroff` through the shutdown gate    6.92 s        the gate's marker,
+#     the same fast path
+#   controller-initiated with a 34 s holder on    8.27 s        the daemon's ensure
+#     the I2C lock across the request                           gave up (75); the
+#     ExecStop took 3.94 s
+#   `poweroff.real`, `systemctl poweroff` —       8.50 s        no marker: the
+#     nothing pre-armed, no gate                                ExecStop decides from
+#     the job queue, arms the fallback and pre-arms itself, 2.87 s
 #
-# One measurement of a CLEAN shutdown. A node with more dirty pages, a unit
-# slow to stop, or a tired card takes longer, and the power-cut budget does not
+# The last row is the carried value. It is a real code path — anything that
+# reaches wake-guard.service with no marker — and nothing else reserves budget
+# for it. On the controller path the daemon's own ensure (budgeted separately,
+# 5 s) arms first, and request -> power down measured 12.8-14.5 s uncontended
+# and 18.5 s under the 34 s holder, against the 25 s cut.
+#
+# One clean shutdown per path. A node with more dirty pages, a unit slow to
+# stop, or a tired card takes longer, and the power-cut budget does not
 # stretch. Treat the slack over this number as the real safety margin, not the
 # number itself.
-T_SHUTDOWN=8
+T_SHUTDOWN=9
 
 # ── FIRMWARE — Witty Pi 4, ATtiny841 ───────────────────────────────────────
 # Read from WittyPi4.ino. Every counter here is a 1 Hz watchdog tick

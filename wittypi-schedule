@@ -200,7 +200,8 @@ case "$wp_sched_off" in ''|*[!0-9]*)
 esac
 
 # ── Bound 1: the awake window must clear mark-good ─────────────────────────
-# T_MARKGOOD is a MEASURED term (312 s: power-on to the boot counter reset).
+# T_MARKGOOD is a MEASURED term (316 s on the fleet image: power-on to the
+# boot counter reset).
 # An ON window shorter than that is a node whose every scheduled shutdown
 # lands before the slot is marked good — three cycles condemn a slot and six
 # condemn both, for a fault in neither. Read from the shipped timing-terms;
