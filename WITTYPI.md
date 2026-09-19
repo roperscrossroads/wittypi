@@ -192,8 +192,24 @@ problem here. Plug that port into a PC and the PC back-powers the board, so
 the duty cycle silently never happens. The symptom is "the Witty Pi isn't
 cutting power", and the cause is the console cable.
 
+**It can also take the controller off the I2C bus.** Observed on an L3V7
+with a gadget console on the Pi's data port and 5 V also on the Witty Pi's
+USB-C: about 40% of single `i2cget` reads failed, in a strict cycle — roughly
+0.6 s answering, then 2.7 s where each read hung for ~0.5 s and failed,
+repeating every ~3.35 s. Writes failed the same way, so `wittypi configure`
+reported every row as not taken and the board stayed at factory defaults;
+`Iout` read 1.67 A on a Pi Zero W. No other process had the bus open. With
+the data cable unplugged and the Witty Pi as the only supply, 300 of 300
+reads succeeded and the policy applied on the next boot. If reads fail in a
+regular rhythm, look for a second 5 V source before suspecting the firmware.
+
+Unplugging that cable is also a power event for a board still at factory
+defaults: `DEFAULT_ON` is 0 there, so if the Pi was really running on the
+PC's power it goes dark and waits for the button.
+
 **So the console should be UART0 on the header**, reached with a USB-TTL
-adapter, not a USB-gadget serial console.
+adapter, not a USB-gadget serial console. Where the HAT covers the UART, use
+WiFi (`wifi-join`) and SSH instead.
 
 **And that has its own interaction, which is not hypothetical.** The
 controller decides the Pi has shut down by watching **TXD (GPIO-14) fall**.
