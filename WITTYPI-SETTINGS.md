@@ -82,6 +82,23 @@ An unrecognised topology is refused rather than defaulted — a typo that
 quietly left the battery unprotected would otherwise look like a working
 node.
 
+### The Witty Pi 4 L3V7
+
+The same `/data/wittypi.env` works unchanged on an L3V7 (firmware id `0x37`)
+with `WITTYPI_TOPOLOGY=usb5v` — the only topology supported on it. The tool
+tells the boards apart by register 0, and two rows differ from the classic
+table in §2:
+
+| Reg | Classic `usb5v` | L3V7 `usb5v` | Why |
+|---|---|---|---|
+| 19 `LOW_VOLTAGE` | 255 | **31** | the L3V7's own seed; 255 reverts, and on battery starves guaranteed wake |
+| 22 `RECOVERY_VOLTAGE` | 255 | **1** | a wake-on-USB flag on this board, not a voltage |
+
+Everything else — 17, 21, 41, 44-49, the trims — is the same register with
+the same meaning, and gets the same value. `vin2s`/`vin3s` are refused on the
+L3V7, as is an unset topology while it reads `POWER_MODE` 2 (on battery). The
+register-level reasoning is in [`WITTYPI.md`](WITTYPI.md#the-l3v7-variant).
+
 ---
 
 ## 2. What `wittypi configure` changes from factory defaults
@@ -98,7 +115,7 @@ Six writes, seven registers already correct — derived from
 | 45 `OVER_TEMP_ACTION` | 0 | **1** | set |
 | 46 `OVER_TEMP_POINT` | 80 | **70** | set |
 | 49 `GUARANTEED_WAKE` | 0 | **26** | set |
-| 19, 22 | 255, 255 | 255, 255 | ok on a USB-C topology — see §3 for why 255 is safe there |
+| 19, 22 | 255, 255 | 255, 255 | ok on a USB-C topology — see §3 for why 255 is safe there. **L3V7: 31, 1** — see §1 |
 | 23, 41, 43, 48 | 0 | 0 | ok |
 
 A successful `wittypi configure` / `wittypi check` run reports something

@@ -12,6 +12,12 @@ ability to cut its own power and wake itself later. That last part is what
 makes an unattended, battery- or solar-powered node possible: the Pi is
 *off*, not idle, for most of the day.
 
+Two boards are supported, told apart by the firmware id in register 0: the
+classic Witty Pi 4 and Mini (`0x26`), and the **Witty Pi 4 L3V7** (`0x37`),
+on 5 V USB-C (`WITTYPI_TOPOLOGY=usb5v`). They share a register map but not
+its meaning — see [`WITTYPI.md`](WITTYPI.md#the-l3v7-variant). Any other id is
+treated as no controller, and nothing is ever written to it.
+
 ## Why not the vendor's script
 
 UUGear ships `utilities.sh` — nearly 700 lines that assume Raspberry Pi OS.

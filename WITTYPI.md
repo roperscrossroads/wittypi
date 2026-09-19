@@ -239,6 +239,42 @@ than physically plausible.
 
 ---
 
+### The L3V7 variant
+
+The **Witty Pi 4 L3V7** is the same design built around a 3.7 V Li-ion cell
+and USB-C instead of the 6-30 V DC/DC input. Its firmware
+(`Firmware/WittyPi4_L3V7/WittyPi4_L3V7.ino`, same V4.23 revision 7) keeps
+**every register number** — all 73 `I2C_*` defines match, and the test suite
+checks that against the vendored source — but changes what four of them mean:
+
+| Reg | Classic (`0x26`) | L3V7 (`0x37`) |
+|---|---|---|
+| 0 `ID` | `0x26` | **`0x37`** |
+| 7 `POWER_MODE` | 1 = VIN (DC/DC), 0 = USB-C | **0 = USB-C, 2 = battery** — never 1 |
+| 11 `ACTION_REASON` | 1-8, 10-12 | adds **9 = USB 5V connected** |
+| 19 `LOW_VOLTAGE` | seeds 255 (off) | seeds **31** (3.1 V). Low-voltage detection runs whenever `POWER_MODE != 0`, and guaranteed wake on battery fires only when `vin > reg/10` |
+| 22 `RECOVERY_VOLTAGE` | volts ×10, 255 = off | **a flag**: non-zero wakes the Pi when USB returns after running on battery; 0 does nothing |
+
+The classic board's "voltage restored" wake is gone; the battery-to-USB wake
+replaces it, after the same `DEFAULT_ON_DELAY` (so the ≤32 ceiling covers it
+too).
+
+**Why this needs its own policy, not the classic one.** The classic `usb5v`
+rows write 255 to 19 and 22. On an L3V7 that is wrong twice over: 255 in 19
+is the EEPROM "never written" sentinel against a seed of 31, so it reverts at
+the next MCU power loss; and while it stands, if the board ever reads
+`POWER_MODE` 2, guaranteed wake waits for `vin > 25.5 V` — never, from a
+3.7 V cell. So the driver identifies the board (`wp_present` sets
+`WP_MODEL`), and on the L3V7 `usb5v` writes **19 = 31** (the seed; inert on a
+USB feed) and **22 = 1** (the vendor's meaning of its own seed; inert with no
+battery, and "power returns, Pi returns" with one fitted as a UPS). The
+classic battery topologies (`vin2s`/`vin3s`) are refused on it, and
+`wittypi set` refuses a 19 outside 2.5-4.0 V or a 22 other than 0/1 there.
+
+The L3V7 runs **stock** firmware: the patch in
+[`firmware/wittypi/`](firmware/wittypi/) is built from the classic source and
+must never be flashed onto one (see the warning there).
+
 ## The three facts that shape everything
 
 **1. Shutdown is requested on GPIO-4, and the Pi decides when to obey.** The

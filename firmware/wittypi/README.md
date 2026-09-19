@@ -11,6 +11,14 @@ precisely why the patches carry their whole rationale in the header: there's
 no CI to catch a mistake, and a deployed, unreachable board has no second
 chance.
 
+> **Classic board only. Never flash this onto a Witty Pi 4 L3V7.** The patch
+> and the hex in `build/` are built from `Firmware/WittyPi4/WittyPi4.ino`. On
+> an L3V7 the flashed image would report id `0x26`, so the driver would take
+> it for a classic board and write the classic policy — and its `POWER_MODE`
+> test (`vin > 5.25 V`) never reads a 3.7 V cell as a battery, so low-voltage
+> protection would never arm. The L3V7 runs stock `WittyPi4_L3V7` firmware,
+> without this patch's fail-on for register 17; porting it is open (below).
+
 ## Applying
 
 ```bash
@@ -95,6 +103,11 @@ document. Three facts that surprise people:
    from Linux, since writes are only accepted from register index 16 up.
 
 ## Still open
+
+- **An L3V7 port of `0001`.** The L3V7 source differs (battery-mode power
+  logic, a USB-connect wake) and its flash headroom is unmeasured, so the
+  patch does not apply as-is. Until then an L3V7 relies on userspace writing
+  register 17 = 1 at every boot, and on the ≤32 cap on register 47.
 
 - **Magic + version, validated on load, re-seeding from firmware on
   mismatch.** This is the only thing that turns a corrupted EEPROM into a
