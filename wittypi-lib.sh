@@ -938,9 +938,16 @@ wp_wait_present() {
 }
 
 # Does this board's firmware implement guaranteed wake (WITTYPI.md layer 3)?
+#   0  yes   1  no, the revision predates it   2  the revision did not answer
+#
+# 2 is its own answer. Folded into 1, a read that NAKed was logged as "revision
+# 7 predates guaranteed wake (needs 7)", and configure silently dropped
+# register 49 from the policy — after which check had nothing to compare, and
+# could call a board with no backstop "in sync".
 wp_has_guaranteed_wake() {
-    wp_hgw_rev=$(wp_get "$WP_REG_FW_REVISION") || return 1
-    [ "$wp_hgw_rev" -ge "$WP_MIN_REV_GUARANTEED_WAKE" ]
+    wp_hgw_rev=$(wp_get_stable "$WP_REG_FW_REVISION") || return 2
+    [ "$wp_hgw_rev" -ge "$WP_MIN_REV_GUARANTEED_WAKE" ] || return 1
+    return 0
 }
 
 # ── Is the last-resort backstop actually set? ──────────────────────────────

@@ -516,8 +516,22 @@ wp_policy() {
     wp_emit "$WP_REG_RTC_CTRL1" 0 'RTC Control_1 (24h mode, defaults)'
 
     # Layer 3, and only where the firmware implements it. A setting that
-    # silently does nothing is worse than an error.
-    if wp_has_guaranteed_wake; then
+    # silently does nothing is worse than an error. And an unreadable
+    # revision is refused, not read as "old firmware": that would drop
+    # register 49 from the table, and the backstop with it.
+    wp_has_guaranteed_wake; wp_p_hgw=$?
+    if [ "$wp_p_hgw" -eq 2 ]; then
+        printf 'REFUSING: the firmware revision (register %s) did not answer, so whether
+' \
+            "$WP_REG_FW_REVISION" >&2
+        printf 'guaranteed wake exists is unknown. Applying the policy without register %s
+' \
+            "$WP_REG_GUARANTEED_WAKE" >&2
+        printf 'would leave the last-resort wake to whatever the board holds. Nothing written.
+' >&2
+        exit 2
+    fi
+    if [ "$wp_p_hgw" -eq 0 ]; then
         # ── 26, not 24, and the difference is the whole point ──────────────
         # guaranteedWakeCounter resets on every powerOn() (WittyPi4.ino:449),
         # so layer 3 expires that long after the LAST power-on. Set equal to
@@ -609,33 +623,61 @@ case "$WP_CMD" in
 status)
     wp_require
     wp_cli_lock s 10
+    # ── A read that fails prints "unreadable", never a default ─────────────
+    # Each value here is ONE i2cget, and a controller that is busy in its
+    # own watchdog interrupt NAKs (the vendor's i2c_read retries for exactly
+    # this). An empty read used to reach an integer test and abort the
+    # revision line, and a failed POWER_MODE read printed as "USB-C" — a
+    # confident answer made of nothing. Now unreadable says so.
+    wp_st() { wp_get "$1" || printf 'unreadable'; }
     printf 'controller        %s\n' "$(wp_model_name)"
-    printf 'firmware id       0x%02x\n' "$(wp_get "$WP_REG_ID")"
-    wp_rev=$(wp_get "$WP_REG_FW_REVISION")
+    printf 'firmware id       0x%02x\n' "$(wp_get "$WP_REG_ID" || echo 0)"
+    wp_rev=$(wp_st "$WP_REG_FW_REVISION")
     printf 'firmware revision %s\n' "$wp_rev"
-    if [ "$wp_rev" -ge "$WP_MIN_REV_GUARANTEED_WAKE" ]; then
-        printf 'guaranteed wake   available (WITTYPI.md layer 3 is usable)\n'
+    case "$wp_rev" in
+        unreadable)
+            printf 'guaranteed wake   UNKNOWN — the revision register did not answer\n' ;;
+        *)
+            if [ "$wp_rev" -ge "$WP_MIN_REV_GUARANTEED_WAKE" ]; then
+                printf 'guaranteed wake   available (WITTYPI.md layer 3 is usable)\n'
+            else
+                printf 'guaranteed wake   NOT AVAILABLE — needs revision %s.\n' \
+                    "$WP_MIN_REV_GUARANTEED_WAKE"
+                printf '                  This board has TWO rollback defences, not three.\n'
+            fi ;;
+    esac
+    wp_rsn=$(wp_st "$WP_REG_ACTION_REASON")
+    case "$wp_rsn" in
+        unreadable) printf 'last action       unreadable\n' ;;
+        *)          printf 'last action       reason %s — %s\n' "$wp_rsn" "$(wp_reason_name "$wp_rsn")" ;;
+    esac
+    if wp_pm=$(wp_get "$WP_REG_POWER_MODE"); then
+        printf 'power mode        %s\n' "$(wp_reg_decode "$WP_REG_POWER_MODE" "$wp_pm")"
     else
-        printf 'guaranteed wake   NOT AVAILABLE — needs revision %s.\n' \
-            "$WP_MIN_REV_GUARANTEED_WAKE"
-        printf '                  This board has TWO rollback defences, not three.\n'
+        printf 'power mode        unreadable\n'
     fi
-    printf 'last action       reason %s\n' "$(wp_get "$WP_REG_ACTION_REASON")"
-    wp_pm=$(wp_get "$WP_REG_POWER_MODE") || wp_pm=''
-    printf 'power mode        %s\n' "$(wp_reg_decode "$WP_REG_POWER_MODE" "${wp_pm:-0}")"
-    printf 'Vin               %sV\n'  "$(wp_read_pair "$WP_REG_VIN_INT"  "$WP_REG_VIN_DEC")"
-    printf 'Vout              %sV\n'  "$(wp_read_pair "$WP_REG_VOUT_INT" "$WP_REG_VOUT_DEC")"
-    printf 'Iout              %sA'    "$(wp_read_pair "$WP_REG_IOUT_INT" "$WP_REG_IOUT_DEC")"
-    # A Pi Zero W running Linux draws ~120-150 mA. Anything far below that is
-    # the sensor, not the board — say so here rather than let the number be
-    # copied into a power budget. Register 26 (ADJ_IOUT) is the trim.
-    wp_ii=$(wp_get "$WP_REG_IOUT_INT"); wp_id=$(wp_get "$WP_REG_IOUT_DEC")
-    if [ "$wp_ii" -eq 0 ] && [ "$wp_id" -lt 8 ]; then
-        printf '   implausibly low for a running Pi — see reg 26 ADJ_IOUT'
+    printf 'Vin               %s\n' "$(wp_read_pair "$WP_REG_VIN_INT"  "$WP_REG_VIN_DEC"  && echo V || echo unreadable)"
+    printf 'Vout              %s\n' "$(wp_read_pair "$WP_REG_VOUT_INT" "$WP_REG_VOUT_DEC" && echo V || echo unreadable)"
+    if wp_iout=$(wp_read_pair "$WP_REG_IOUT_INT" "$WP_REG_IOUT_DEC"); then
+        printf 'Iout              %sA' "$wp_iout"
+        # A Pi Zero W running Linux draws ~120-150 mA. Anything far below that
+        # is the sensor, not the board — say so here rather than let the number
+        # be copied into a power budget. Register 26 (ADJ_IOUT) is the trim.
+        # Judged on the pair just printed, not on a second pair of reads.
+        wp_ii=${wp_iout%%.*}; wp_id=${wp_iout#*.}; wp_id=${wp_id#0}
+        if [ "$wp_ii" -eq 0 ] && [ "${wp_id:-0}" -lt 8 ]; then
+            printf '   implausibly low for a running Pi — see reg 26 ADJ_IOUT'
+        fi
+        printf '\n'
+    else
+        printf 'Iout              unreadable\n'
     fi
-    printf '\n'
-    printf 'RTC               %s\n'   "$(wp_rtc_read || printf ' (lost power)')"
-    printf 'temperature       %s°C\n' "$(wp_temp_c || echo '?')"
+    # wp_rtc_read fails two ways: a date with year 00 (the clock really did
+    # lose power) or nothing at all (a register did not answer). Only the
+    # first is "lost power".
+    wp_rtc=$(wp_rtc_read) && wp_rtc_note='' || wp_rtc_note=' (lost power)'
+    printf 'RTC               %s\n' "${wp_rtc:+$wp_rtc$wp_rtc_note}${wp_rtc:-unreadable}"
+    printf 'temperature       %s\n' "$(wp_temp_c && echo '°C' || echo unreadable)"
     ;;
 
 rtc)

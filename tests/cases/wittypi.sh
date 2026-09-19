@@ -351,6 +351,8 @@ stub_i2c() {
         printf '#!/bin/sh\n'
         # firmware id, so wp_present passes; WP_STUB_ID makes it another board
         printf '[ "$4" = "0" ] && { echo "${WP_STUB_ID:-0x26}"; exit 0; }\n'
+        # WP_FAIL_READS: registers that NAK, as a busy controller does
+        printf 'case " ${WP_FAIL_READS:-} " in *" $4 "*) echo "Error: Read failed" >&2; exit 2 ;; esac\n'
         printf 'if [ -f "%s/regs/$4" ]; then cat "%s/regs/$4"; else echo 0x00; fi\n' "$1" "$1"
     } > "$1/bin/i2cget"
     # A fixed clock, so the test exercises AUGUST every day of the year rather
@@ -1753,4 +1755,40 @@ assert_contains "$(hw_call "$F" "WP_MODEL=l3v7; wp_reg_decode 19 255")" "INVALID
 assert_contains "$(hw_call "$F" "WP_MODEL=l3v7; wp_reg_decode 0 55")" "L3V7" "0x37 is named"
 assert_contains "$(hw_call "$F" wp_reg_decode 11 9)" "USB 5V connected" "reason 9"
 assert_eq "disabled" "$(hw_call "$F" "WP_MODEL=wp4; wp_reg_decode 22 255")" "the classic 22 is unchanged"
+fixture_rm "$F"
+
+describe "status: a register that does not answer says so, and nothing aborts"
+# Seen on an L3V7: most single reads NAKed, the revision line died on
+# "[: : integer expected", and an unread POWER_MODE printed as "USB-C".
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WP_STUB_ID=0x37 WP_FAIL_READS="12 11 7 1 58 50"
+run_rpi_unit "$F" wittypi status
+assert_eq "0" "$RUN_RC" "status completes"
+assert_not_contains "$RUN_OUT" "integer expected" "no shell error from an empty read"
+assert_contains "$RUN_OUT" "firmware revision unreadable" "the revision says unreadable"
+assert_contains "$RUN_OUT" "guaranteed wake   UNKNOWN" "and layer 3 is unknown, not 'NOT AVAILABLE'"
+assert_contains "$RUN_OUT" "power mode        unreadable" "POWER_MODE is not guessed as USB-C"
+assert_not_contains "$RUN_OUT" "USB-C" "no feed is claimed at all"
+assert_contains "$RUN_OUT" "Vin               unreadable" "Vin"
+assert_contains "$RUN_OUT" "RTC               unreadable" "an unread clock is not 'lost power'"
+assert_contains "$RUN_OUT" "temperature       unreadable" "temperature"
+unset WP_FAIL_READS
+printf '0x01\n' > "$F/regs/61"; printf '0x01\n' > "$F/regs/63"   # day 1, month 1, year 00
+run_rpi_unit "$F" wittypi status
+assert_contains "$RUN_OUT" "firmware revision 7" "all readable: the revision"
+assert_contains "$RUN_OUT" "power mode        5 V straight in (USB-C)" "and the feed"
+assert_contains "$RUN_OUT" "last action       reason 0" "and the reason, decoded"
+assert_contains "$RUN_OUT" "(lost power)" "a year-00 clock IS lost power"
+unset WP_STUB_ID
+fixture_rm "$F"
+
+describe "configure refuses when the revision does not answer, rather than dropping register 49"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WITTYPI_TOPOLOGY=usb5v WP_FAIL_READS=12
+run_rpi_unit "$F" wittypi configure
+assert_eq "2" "$RUN_RC" "exit 2"
+assert_contains "$RUN_OUT" "did not answer" "names the unreadable revision"
+assert_not_contains "$RUN_OUT" "predates guaranteed wake" "and does not call it old firmware"
+no_writes "$F" "and nothing was written"
+unset WITTYPI_TOPOLOGY WP_FAIL_READS
 fixture_rm "$F"

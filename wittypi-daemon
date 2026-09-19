@@ -126,9 +126,13 @@ wp_log "Vin=${wp_vin}V Vout=${wp_vout}V Iout=${wp_iout}A"
 # defence against a corrupt schedule. Say so at boot if this board can't do
 # it, because the alternative is discovering it the first time a corrupt
 # schedule leaves the board asleep permanently.
-if ! wp_has_guaranteed_wake; then
+wp_has_guaranteed_wake; wp_hgw=$?
+if [ "$wp_hgw" -eq 1 ]; then
     wp_log "WARNING: firmware revision $wp_rev predates guaranteed wake (needs \
 $WP_MIN_REV_GUARANTEED_WAKE). WITTYPI.md layer 3 is NOT available on this board."
+elif [ "$wp_hgw" -eq 2 ]; then
+    wp_log "WARNING: the firmware revision register did not answer — whether \
+WITTYPI.md layer 3 exists on this board is unknown, not absent."
 fi
 
 # ── Let the halt line settle before trusting it — but bound the wait ───────
