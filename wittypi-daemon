@@ -100,7 +100,7 @@ WP_DAEMON_PROBE_TRIES="${WITTYPI_DAEMON_PROBE_TRIES:-10}"
 wp_probe=1
 while ! wp_present; do
     if [ "$wp_probe" -eq 1 ]; then
-        wp_log "controller did not answer on probe 1: register 0 did not read 0x26 twice — retrying up to $WP_DAEMON_PROBE_TRIES times"
+        wp_log "controller did not answer on probe 1: register 0 did not read a known id (0x26 or 0x37) twice — retrying up to $WP_DAEMON_PROBE_TRIES times"
     fi
     if [ "$wp_probe" -ge "$WP_DAEMON_PROBE_TRIES" ]; then
         wp_log "no controller at $WP_ADDR on i2c-$WP_BUS after $WP_DAEMON_PROBE_TRIES probes — not fitted. Nothing to sequence."
@@ -113,7 +113,7 @@ done
 
 wp_rev=$(wp_get "$WP_REG_FW_REVISION") || wp_rev="?"
 wp_reason=$(wp_get "$WP_REG_ACTION_REASON") || wp_reason="?"
-wp_log "controller present, firmware revision $wp_rev, last action reason $wp_reason"
+wp_log "controller present: $(wp_model_name), firmware revision $wp_rev, last action reason $wp_reason"
 
 # Telemetry many similar controllers can't offer at all. Logged once per boot
 # so the journal carries a power record even when nothing is watching.

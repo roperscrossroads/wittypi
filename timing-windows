@@ -240,6 +240,11 @@ PULSE=$(term FW_PULSE_INTERVAL)
 # when the controller is recompiled with different settings, and precisely the
 # case where every downstream guard quietly starts reasoning about hardware
 # that no longer exists.
+#
+# Either firmware source works: the Witty Pi 4 L3V7 (id 0x37) runs the same
+# timing code — power-cut delay, default-on delay, pulse — as the classic
+# board, so these terms hold for both. Its one extra wait (the default-on
+# delay again, on a USB-returned wake) is bounded by the same register-47 cap.
 FW_SRC=${WITTYPI_FW_SRC:-}
 FW_DRIFT=
 if [ -r "$FW_SRC" ]; then

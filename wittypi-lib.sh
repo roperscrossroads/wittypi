@@ -40,14 +40,14 @@ WP_SYSUP_PIN="${WITTYPI_SYSUP_PIN:-17}"
 
 # ── Registers ──────────────────────────────────────────────────────────────
 # Read-only telemetry and state.
-WP_REG_ID=0                 # firmware id, expect 0x26
+WP_REG_ID=0                 # firmware id: 0x26 Witty Pi 4, 0x37 L3V7 — see WP_ID_*
 WP_REG_VIN_INT=1
 WP_REG_VIN_DEC=2
 WP_REG_VOUT_INT=3
 WP_REG_VOUT_DEC=4
 WP_REG_IOUT_INT=5
 WP_REG_IOUT_DEC=6
-WP_REG_POWER_MODE=7         # 1 = via LDO/DC-DC (VIN), 0 = 5V USB-C
+WP_REG_POWER_MODE=7         # wp4: 1 = VIN (DC/DC), 0 = 5V USB-C. l3v7: 0 = USB-C, 2 = battery
 WP_REG_LV_SHUTDOWN=8
 WP_REG_ALARM1_TRIGGERED=9
 WP_REG_ALARM2_TRIGGERED=10
@@ -60,7 +60,7 @@ WP_REG_PULSE_INTERVAL=18    # seconds between sleep-time housekeeping pulses
 WP_REG_LOW_VOLTAGE=19       # x10, 255 = disabled
 WP_REG_BLINK_LED=20         # ms the white LED stays on per pulse, 0 = never
 WP_REG_POWER_CUT_DELAY=21   # x10
-WP_REG_RECOVERY_VOLTAGE=22  # x10, 255 = disabled
+WP_REG_RECOVERY_VOLTAGE=22  # wp4: x10, 255 = disabled. l3v7: a FLAG, non-zero = wake on USB return
 WP_REG_DUMMY_LOAD=23        # ms the output is re-asserted per pulse, 0 = never
 WP_REG_ADJ_VIN=24           # signed hundredths of a volt
 WP_REG_ADJ_VOUT=25          # signed hundredths of a volt
@@ -106,6 +106,48 @@ WP_REG_GUARANTEED_WAKE=49   # bits 0-6 duration, bit 7 unit (0=hours 1=days)
 # hex (see firmware/wittypi/README.md), not by a register. Named here purely
 # so a register dump reports it as SITE_MARK rather than a bare number.
 WP_REG_SITE_MARK=13
+
+# ── Which controller: the id register decides, and nothing else does ──────
+# Two boards answer at 0x08 with the SAME register map (all 73 I2C_* defines
+# agree between Firmware/WittyPi4 and Firmware/WittyPi4_L3V7 at V4.23) and
+# different meanings in four of them:
+#
+#   reg  7 POWER_MODE        wp4: 1 = VIN, 0 = USB-C   l3v7: 0 = USB-C, 2 = battery
+#   reg 11 ACTION_REASON     l3v7 adds 9 = USB 5V connected
+#   reg 19 LOW_VOLTAGE       wp4 seeds 255 (off)       l3v7 seeds 31, and gates
+#                            guaranteed wake on battery on vin > reg/10
+#   reg 22 RECOVERY_VOLTAGE  wp4: volts x10            l3v7: a flag, non-zero =
+#                            wake the Pi when USB returns after battery
+#
+# So a policy that is right for one is wrong for the other: the classic
+# usb5v row "19 = 255" on an L3V7 reverts to 31 at the next MCU power loss,
+# and if the board ever reads POWER_MODE 2 it turns guaranteed wake's gate
+# into vin > 25.5 V — never true, layer 3 starved for good.
+#
+# wp_present sets WP_MODEL from a stable read of register 0, and ANY other id
+# is "no controller": a board this file does not know is never written to.
+# The Mini is built from the classic source and reports 0x26.
+WP_ID_WP4=38                # 0x26 — Witty Pi 4 and Witty Pi 4 Mini
+WP_ID_L3V7=55               # 0x37 — Witty Pi 4 L3V7
+WP_MODEL=""                 # wp4 | l3v7, set by wp_present; empty = unknown
+
+# The L3V7's compiled seed for register 19 (initializeRegisters in
+# WittyPi4_L3V7.ino), and the range a value there may take: a 1S Li-ion
+# window. Anything outside it on this board is a classic-board number
+# (6.6 V for a 2S pack reads as "battery always low") or the classic
+# "disabled" 255, and both starve guaranteed wake the moment the board is on
+# battery.
+WP_L3V7_LOW_VOLTAGE=31
+WP_L3V7_LOW_VOLTAGE_MIN=25
+WP_L3V7_LOW_VOLTAGE_MAX=40
+
+wp_model_name() {
+    case "${1:-$WP_MODEL}" in
+        wp4)  echo "Witty Pi 4" ;;
+        l3v7) echo "Witty Pi 4 L3V7" ;;
+        *)    echo "unknown" ;;
+    esac
+}
 
 # ── NAMES AND MEANINGS ─────────────────────────────────────────────────────
 # A register dump of bare bytes is a dump nobody reads carefully — `44 236`
@@ -197,6 +239,7 @@ wp_reason_name() {
         3)  echo "button click" ;;       4)  echo "low voltage" ;;
         5)  echo "voltage restored" ;;   6)  echo "over temperature" ;;
         7)  echo "below temperature" ;;  8)  echo "alarm1 delayed" ;;
+        9)  echo "USB 5V connected (L3V7)" ;;
         10) echo "power connected" ;;    11) echo "reboot" ;;
         12) echo "guaranteed wake" ;;    *)  echo "unknown ($1)" ;;
     esac
@@ -219,12 +262,25 @@ wp_temp_action() {
 wp_reg_decode() {
     wp_rd_r=$1; wp_rd_v=$2; wp_rd_mark=${3:-}
     case "$wp_rd_r" in
-        0)  [ "$wp_rd_v" = 38 ] && echo "0x26, the expected id" || echo "0x$(printf '%02x' "$wp_rd_v") — NOT 0x26" ;;
+        0)  case "$wp_rd_v" in
+                "$WP_ID_WP4")  echo "0x26, Witty Pi 4" ;;
+                "$WP_ID_L3V7") echo "0x37, Witty Pi 4 L3V7" ;;
+                *) echo "0x$(printf '%02x' "$wp_rd_v") — NOT a known id (0x26 or 0x37)" ;;
+            esac ;;
         1|3)   echo "${wp_rd_v} V (integer part)" ;;
         2|4)   echo "0.$(printf '%02d' "$wp_rd_v") V (hundredths)" ;;
         5)     echo "${wp_rd_v} A (integer part)" ;;
         6)     echo "0.$(printf '%02d' "$wp_rd_v") A (hundredths)" ;;
-        7)  [ "$wp_rd_v" = 1 ] && echo "VIN, via the DC/DC" || echo "5 V straight in (USB-C)" ;;
+        # POWER_MODE's encoding is per model; see WP_ID_* above.
+        7)  if [ "$WP_MODEL" = l3v7 ]; then
+                case "$wp_rd_v" in
+                    0) echo "5 V straight in (USB-C)" ;;
+                    2) echo "on the 3.7 V battery" ;;
+                    *) echo "UNEXPECTED on an L3V7 (0 = USB-C, 2 = battery)" ;;
+                esac
+            else
+                [ "$wp_rd_v" = 1 ] && echo "VIN, via the DC/DC" || echo "5 V straight in (USB-C)"
+            fi ;;
         8|9|10|39|40|41|42|48)
             [ "$wp_rd_v" = 0 ] && echo "no" || echo "yes" ;;
         11) wp_reason_name "$wp_rd_v" ;;
@@ -237,13 +293,19 @@ wp_reg_decode() {
         # flash is full — so this states BOTH readings rather than guessing
         # one. A confident wrong answer here reads as "this board will come
         # back" about a board that will not.
-        17)
+        # The L3V7 has no site firmware (firmware/wittypi/ patches the
+        # classic source only), so there it is stock and one reading suffices.
+        17) if [ "$WP_MODEL" = l3v7 ]; then
+                [ "$wp_rd_v" = 1 ] && echo "on when power returns" \
+                    || echo "WAITS FOR THE BUTTON (stock L3V7 firmware)"
+            else
             case "$wp_rd_v" in
                 1)  echo "on when power returns (both firmwares)" ;;
                 90) echo "site fw: WAITS FOR THE BUTTON · stock: on" ;;
                 0)  echo "stock: WAITS FOR THE BUTTON · site fw: on" ;;
                 *)  echo "stock: WAITS FOR THE BUTTON · site fw: on" ;;
-            esac ;;
+            esac
+            fi ;;
         18|47) echo "${wp_rd_v} s" ;;
         # Plain BCD, no disable bit — don't reuse the 65-69 pattern here.
         # These are the ATtiny's own alarm registers, read by
@@ -258,8 +320,22 @@ wp_reg_decode() {
         31|36) echo "weekday $(wp_bcd "$wp_rd_v") — defined, unused by the firmware's match" ;;
         37)    echo "calibration $wp_rd_v — PER BOARD, a flash erases it" ;;
         38)    [ "$wp_rd_v" = 1 ] && echo "temperature compensation on" || echo "off" ;;
-        19|22) [ "$wp_rd_v" = 255 ] && echo "disabled" \
-                   || echo "$(( wp_rd_v / 10 )).$(( wp_rd_v % 10 )) V" ;;
+        19) if [ "$WP_MODEL" = l3v7 ] && [ "$wp_rd_v" = 255 ]; then
+                echo "255 — INVALID on an L3V7: reverts to 3.1 V, and on battery starves guaranteed wake"
+            elif [ "$wp_rd_v" = 255 ]; then
+                echo "disabled"
+            else
+                echo "$(( wp_rd_v / 10 )).$(( wp_rd_v % 10 )) V"
+            fi ;;
+        # On the L3V7 register 22 is not a voltage at all.
+        22) if [ "$WP_MODEL" = l3v7 ]; then
+                [ "$wp_rd_v" = 0 ] && echo "no wake when USB returns" \
+                    || echo "wake the Pi when USB returns after battery"
+            elif [ "$wp_rd_v" = 255 ]; then
+                echo "disabled"
+            else
+                echo "$(( wp_rd_v / 10 )).$(( wp_rd_v % 10 )) V"
+            fi ;;
         20|23) [ "$wp_rd_v" = 0 ] && echo "never" || echo "${wp_rd_v} ms" ;;
         21)    echo "$(( wp_rd_v / 10 )).$(( wp_rd_v % 10 )) s" ;;
         24|25) echo "$(wp_signed "$wp_rd_v") hundredths of a volt" ;;
@@ -341,7 +417,83 @@ wp_pol_val() {
 # two where storing 255 survives an MCU restart (initializeRegisters rewrites
 # the default over it, which for these is a no-op). Anywhere else 255 means
 # "never written" and erases itself — see WP_EEPROM_UNSET.
-WP_255_IS_LEGAL="$WP_REG_LOW_VOLTAGE $WP_REG_RECOVERY_VOLTAGE"
+#
+# Per model: on the L3V7 register 19's compiled default is 31, not 255, so
+# there only 22 qualifies (its seed is still 255, and any non-zero value
+# means the same thing).
+wp_255_is_legal() {
+    case "$WP_MODEL:$1" in
+        l3v7:"$WP_REG_RECOVERY_VOLTAGE") return 0 ;;
+        l3v7:*) return 1 ;;
+        *:"$WP_REG_LOW_VOLTAGE"|*:"$WP_REG_RECOVERY_VOLTAGE") return 0 ;;
+    esac
+    return 1
+}
+
+# ── The last check before a byte reaches the controller ────────────────────
+# wp_vet_write <reg> <value> — 0 if this value may be written to this
+# register ON THE MODEL wp_present found, else logs why and returns 2.
+#
+# Run over the whole policy by wp_sanity (so configure refuses BEFORE its
+# first write, never half-way through the table) and by `wittypi set`, the
+# raw escape hatch that otherwise writes any byte anywhere.
+#
+# Unknown model refuses everything: a controller this file cannot name is
+# one whose register meanings it does not know.
+#
+# Only the registers whose meaning differs are policed here — 19 and 22.
+# The classic board keeps its existing, permissive `set`.
+wp_vet_write() {
+    case "$WP_MODEL" in
+        wp4) return 0 ;;
+        l3v7) ;;
+        *)
+            wp_log "REFUSING: no known controller identified (register 0 must read 0x26 or 0x37) — nothing is written to a board whose register meanings are unknown"
+            return 2 ;;
+    esac
+    # `set` takes what i2cset takes — decimal or 0x hex — and a value that is
+    # neither must not slip past a comparison that errors (an erroring `[`
+    # is false on BOTH sides of a range check). Arithmetic expansion reads
+    # the same bases i2cset's strtol does, leading-zero octal included.
+    # The patterns are exact because arithmetic is not forgiving: "abc"
+    # expands as a variable name (0), and a bare "0x" is a FATAL syntax error
+    # that no `||` can catch.
+    #
+    # Leading-zero decimal is octal to both arithmetic and i2cset's strtol,
+    # and a "08" or "019" is then invalid — fatal here, so refused outright.
+    case "$2" in
+        0x?*|0X?*)   case "${2#0[xX]}" in *[!0-9a-fA-F]*) wp_vw_ok=0 ;; *) wp_vw_ok=1 ;; esac ;;
+        *[!0-9]*|'') wp_vw_ok=0 ;;
+        0?*[89]*|0[89]*) wp_vw_ok=0 ;;
+        *)           wp_vw_ok=1 ;;
+    esac
+    if [ "$wp_vw_ok" != 1 ]; then
+        wp_log "REFUSING: '$2' is not a byte value (decimal, or 0x hex)"
+        return 2
+    fi
+    wp_vw_v=$(( $2 ))
+    case "$1" in
+        "$WP_REG_LOW_VOLTAGE")
+            if [ "$wp_vw_v" -lt "$WP_L3V7_LOW_VOLTAGE_MIN" ] || [ "$wp_vw_v" -gt "$WP_L3V7_LOW_VOLTAGE_MAX" ]; then
+                wp_log "REFUSING: register $1 (low voltage) = $2 on an L3V7. It must be \
+$WP_L3V7_LOW_VOLTAGE_MIN..$WP_L3V7_LOW_VOLTAGE_MAX (a 1S pack, x10 V; the vendor seed is \
+$WP_L3V7_LOW_VOLTAGE). 255 does not disable it here — it reverts to the seed at the \
+next MCU power loss, and on battery it makes guaranteed wake wait for vin > 25.5 V, \
+which never comes. A 2S/3S number is the classic board's, and reads as 'battery \
+always low'."
+                return 2
+            fi ;;
+        "$WP_REG_RECOVERY_VOLTAGE")
+            case "$wp_vw_v" in
+                0|1) ;;
+                *)
+                    wp_log "REFUSING: register $1 = $2 on an L3V7. There it is a flag, not a \
+voltage: 0 = do nothing when USB returns, 1 = wake the Pi. Write 0 or 1."
+                    return 2 ;;
+            esac ;;
+    esac
+    return 0
+}
 
 # ── The other end of a range, which is easy to miss ────────────────────────
 # WittyPi4.ino:253 runs `delay(i2cReg[47] * 1000)` and `int` is 16 bits on AVR,
@@ -389,13 +541,17 @@ wp_sanity() {
     printf '%s\n' "$1" | while IFS="$(printf '\t')" read -r wp_sn_r wp_sn_v wp_sn_l; do
         [ -n "$wp_sn_r" ] || continue
         [ "$wp_sn_v" = "$WP_EEPROM_UNSET" ] || continue
-        case " $WP_255_IS_LEGAL " in
-            *" $wp_sn_r "*) continue ;;
-        esac
+        wp_255_is_legal "$wp_sn_r" && continue
         wp_log "SANITY: register $wp_sn_r ($wp_sn_l) would be written 255, which the"
         wp_log "        MCU reads as 'never written' and replaces with its compiled"
         wp_log "        default on the next power loss. Use 254, or -2 for a trim."
         printf 'x'
+    done | grep -q x && wp_sn_rc=2
+
+    # ── Per-model register values — every row, before the first write ──────
+    printf '%s\n' "$1" | while IFS="$(printf '\t')" read -r wp_sn_r wp_sn_v wp_sn_l; do
+        [ -n "$wp_sn_r" ] || continue
+        wp_vet_write "$wp_sn_r" "$wp_sn_v" || printf 'x'
     done | grep -q x && wp_sn_rc=2
 
     # ── Temperature: the two points must be ordered ────────────────────────
@@ -429,7 +585,9 @@ enabling register $WP_REG_BELOW_TEMP_ACTION would shut the board down on every b
     # ── Voltage: hysteresis must point the right way, and never half-armed ──
     wp_sn_lv=$(wp_pol_val "$1" "$WP_REG_LOW_VOLTAGE")
     wp_sn_rv=$(wp_pol_val "$1" "$WP_REG_RECOVERY_VOLTAGE")
-    if [ -n "$wp_sn_lv" ] && [ -n "$wp_sn_rv" ]; then
+    # Classic only: on the L3V7 register 22 is a flag, so there is no
+    # hysteresis pair — wp_vet_write polices both registers there instead.
+    if [ "$WP_MODEL" != l3v7 ] && [ -n "$wp_sn_lv" ] && [ -n "$wp_sn_rv" ]; then
         if [ "$wp_sn_lv" = "$WP_EEPROM_UNSET" ] && [ "$wp_sn_rv" != "$WP_EEPROM_UNSET" ]; then
             wp_sn_fail "recovery voltage is set while low voltage is disabled. \
 WittyPi4.ino:407 then arms a voltage-restore wake with nothing to shut the board \
@@ -497,6 +655,7 @@ WP_REASON_VOLTAGE_RESTORE=5
 WP_REASON_OVER_TEMPERATURE=6
 WP_REASON_BELOW_TEMPERATURE=7
 WP_REASON_ALARM1_DELAYED=8
+WP_REASON_USB_5V_CONNECTED=9   # L3V7 only: battery -> USB, register 22 non-zero
 WP_REASON_POWER_CONNECTED=10
 WP_REASON_REBOOT=11
 WP_REASON_GUARANTEED_WAKE=12
@@ -700,9 +859,18 @@ wp_get_maybe_stable() {
 # present" as the normal bench case and exits 0, so a single bad read of
 # register 0 would silently skip the power sequencing for that whole boot —
 # no SYS_UP, no rail cut — and log it as if no controller were fitted.
+#
+# Sets WP_MODEL as a side effect, so call it in the main shell (every caller
+# does: `wp_require`, `while ! wp_present`), never as $(wp_present).
 wp_present() {
+    WP_MODEL=""
     wp_present_id=$(wp_get_stable "$WP_REG_ID") || return 1
-    [ "$wp_present_id" = "38" ]   # 0x26
+    case "$wp_present_id" in
+        "$WP_ID_WP4")  WP_MODEL=wp4 ;;
+        "$WP_ID_L3V7") WP_MODEL=l3v7 ;;
+        *)             return 1 ;;
+    esac
+    return 0
 }
 
 # wp_probe_cause — one line saying WHY the controller did not answer, for a
@@ -722,10 +890,14 @@ wp_probe_cause() {
     wp_pc_out=$(printf '%s' "$wp_pc_out" | tr '\n' ' ' | sed 's/ *$//')
     if [ "$wp_pc_rc" -ne 0 ]; then
         printf 'i2cget failed (rc %s): %s' "$wp_pc_rc" "${wp_pc_out:-no message}"
-    elif [ "$wp_pc_out" != "0x26" ]; then
-        printf 'id register reads %s, expected 0x26' "${wp_pc_out:-nothing}"
     else
-        printf 'one read now answers 0x26: the two-read check failed transiently'
+        case "$wp_pc_out" in
+            0x26|0x37)
+                printf 'one read now answers %s: the two-read check failed transiently' "$wp_pc_out" ;;
+            *)
+                printf 'id register reads %s, expected 0x26 (Witty Pi 4) or 0x37 (L3V7) — an unknown controller is never written to' \
+                    "${wp_pc_out:-nothing}" ;;
+        esac
     fi
     return 0
 }

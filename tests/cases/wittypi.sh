@@ -190,9 +190,13 @@ fi
 # this is skipped rather than failed when it is absent. A skip is honest; a
 # pass would not be.
 describe "register numbers agree with the vendored firmware source"
-INO="$LAYER_DIR/witty/Witty-Pi-4/Firmware/WittyPi4/WittyPi4.ino"
+# WITTYPI_VENDOR_DIR points at a checkout elsewhere (the directory holding
+# Witty-Pi-4/); the default is the historical in-tree witty/.
+VENDOR_DIR="${WITTYPI_VENDOR_DIR:-$LAYER_DIR/witty}"
+INO="$VENDOR_DIR/Witty-Pi-4/Firmware/WittyPi4/WittyPi4.ino"
+L3V7_INO="$VENDOR_DIR/Witty-Pi-4/Firmware/WittyPi4_L3V7/WittyPi4_L3V7.ino"
 if [ ! -f "$INO" ]; then
-    ok "SKIPPED — vendored firmware absent (clone into witty/ to enable)"
+    ok "SKIPPED — vendored firmware absent (clone into witty/ or set WITTYPI_VENDOR_DIR to enable)"
 else
     check_reg() {
         want=$(grep -oE "^#define $1 +[0-9]+" "$INO" | awk '{print $3}')
@@ -219,6 +223,33 @@ else
                 "REASON_ALARM2:WP_REASON_ALARM2"; do
         check_reg "${pair%%:*}" "${pair##*:}"
     done
+
+    # ── The L3V7: the SAME numbers, and the constants only it has ──────────
+    # wp_present lets 0x37 through on the claim that its register map is the
+    # classic one. That claim is checked here, define by define, rather than
+    # trusted — a register that moved would be a silent write to the wrong
+    # setting on the new board.
+    if [ ! -f "$L3V7_INO" ]; then
+        ok "SKIPPED — L3V7 firmware absent from the vendored tree"
+    else
+        defs() { grep -E '^#define I2C_[A-Z0-9_]+ +[0-9]+' "$1" | awk '{print $2, $3}'; }
+        if [ "$(defs "$INO")" = "$(defs "$L3V7_INO")" ]; then
+            ok "every I2C_* register number is identical on the L3V7"
+        else
+            notok "every I2C_* register number is identical on the L3V7" \
+                "they differ — the L3V7 cannot share this register table; diff the two .ino defines"
+        fi
+        l3_seed() { sed -n "s/^ *i2cReg\[$1\] = \(0x[0-9a-fA-F]*\|[0-9]*\);.*/\1/p" "$L3V7_INO" | head -n 1; }
+        l3_num()  { grep -oE "^$1=[0-9]+" "$LIB" | cut -d= -f2; }
+        assert_eq "$(l3_num WP_ID_L3V7)" "$(( $(l3_seed I2C_ID) ))" "WP_ID_L3V7 is the id the L3V7 firmware sets"
+        assert_eq "$(l3_num WP_L3V7_LOW_VOLTAGE)" "$(l3_seed I2C_CONF_LOW_VOLTAGE)" \
+            "WP_L3V7_LOW_VOLTAGE is the firmware's own seed for register 19"
+        assert_eq "$(l3_num WP_REASON_USB_5V_CONNECTED)" \
+            "$(grep -oE '^#define REASON_USB_5V_CONNECTED +[0-9]+' "$L3V7_INO" | awk '{print $3}')" \
+            "reason 9 is the L3V7's USB-connected reason"
+        assert_eq "$(l3_num WP_ID_WP4)" "$(( $(sed -n 's/^ *i2cReg\[I2C_ID\] = \(0x[0-9a-fA-F]*\);.*/\1/p' "$INO" | head -n 1) ))" \
+            "WP_ID_WP4 is the id the classic firmware sets"
+    fi
 fi
 
 # ── BCD conversion: the octal trap ─────────────────────────────────────────
@@ -318,7 +349,8 @@ stub_i2c() {
     } > "$1/bin/i2cset"
     {
         printf '#!/bin/sh\n'
-        printf '[ "$4" = "0" ] && { echo 0x26; exit 0; }\n'   # firmware id, so wp_present passes
+        # firmware id, so wp_present passes; WP_STUB_ID makes it another board
+        printf '[ "$4" = "0" ] && { echo "${WP_STUB_ID:-0x26}"; exit 0; }\n'
         printf 'if [ -f "%s/regs/$4" ]; then cat "%s/regs/$4"; else echo 0x00; fi\n' "$1" "$1"
     } > "$1/bin/i2cget"
     # A fixed clock, so the test exercises AUGUST every day of the year rather
@@ -1219,7 +1251,9 @@ fixture_rm "$F"
 # in the combination, which is a thing only a rule about pairs can see.
 POL() { printf '%s\n' "$@"; }        # each arg is one "reg<TAB>value<TAB>label"
 R() { printf '%s\t%s\t%s' "$1" "$2" "${3:-x}"; }
-sane() { hw_call "$1" "wp_sanity \"\$(cat '$1/pol')\"" >/dev/null 2>&1; }
+# wp_sanity judges a policy FOR A MODEL (wp_vet_write), and refuses outright
+# when none was identified — so the helper states one, as wp_present would.
+sane() { hw_call "$1" "WP_MODEL=${SANE_MODEL:-wp4}; wp_sanity \"\$(cat '$1/pol')\"" >/dev/null 2>&1; }
 pol_write() { F_=$1; shift; POL "$@" > "$F_/pol"; }
 
 describe "a coherent policy passes"
@@ -1573,4 +1607,150 @@ rm -f "$F/policy.env" "$F/regs/49"
 run_rpi_unit "$F" wittypi configure
 assert_eq "26" "$(reg_dec "$F" 49)" "without a policy file the environment's 26 applies"
 unset INVOCATION_ID WITTYPI_TOPOLOGY WITTYPI_GUARANTEED_WAKE
+fixture_rm "$F"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  The Witty Pi 4 L3V7 — same register map, four registers that mean otherwise
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The L3V7 answers 0x37 in register 0. Its POWER_MODE is 0 (USB-C) / 2
+# (battery), register 19 seeds 31 and gates guaranteed wake on battery, and
+# register 22 is a wake-on-USB flag. The classic usb5v rows (19 = 255,
+# 22 = 255) are wrong there: 255 in 19 reverts to 31 at the next power loss,
+# and on battery it turns guaranteed wake's gate into vin > 25.5 V. So every
+# case below asserts on what reaches the stubbed bus — and, for the refusals,
+# that NOTHING does.
+
+no_writes() { # <fixture> <label>
+    if [ -z "$(stub_log "$1" i2cset)" ]; then ok "$2"
+    else notok "$2" "i2cset ran: $(stub_log "$1" i2cset | tr '\n' ' ')"; fi
+}
+
+describe "an unknown controller id is never written to"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WP_STUB_ID=0x99 WITTYPI_TOPOLOGY=usb5v
+run_rpi_unit "$F" wittypi configure
+assert_eq "1" "$RUN_RC" "configure: exit 1, no controller"
+run_rpi_unit "$F" wittypi set DEFAULT_ON 1
+assert_eq "1" "$RUN_RC" "set: exit 1, no controller"
+no_writes "$F" "and not one i2cset reached the bus"
+unset WP_STUB_ID WITTYPI_TOPOLOGY
+fixture_rm "$F"
+
+describe "the L3V7 is recognised, and status says which board and which feed"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WP_STUB_ID=0x37
+printf '0x02\n' > "$F/regs/7"
+run_rpi_unit "$F" wittypi status
+assert_eq "0" "$RUN_RC" "status runs"
+assert_contains "$RUN_OUT" "Witty Pi 4 L3V7" "names the model"
+assert_contains "$RUN_OUT" "on the 3.7 V battery" "POWER_MODE 2 is the battery, not 'USB-C'"
+unset WP_STUB_ID
+fixture_rm "$F"
+
+describe "L3V7 usb5v: 19 = 31 and 22 = 1, never the classic 255s"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WP_STUB_ID=0x37 WITTYPI_TOPOLOGY=usb5v
+run_rpi_unit "$F" wittypi configure
+assert_eq "0" "$RUN_RC" "a clean apply succeeds"
+assert_eq "31" "$(reg_dec "$F" 19)" "19 is the vendor seed 3.1 V, which survives an MCU restart"
+assert_eq "1"  "$(reg_dec "$F" 22)" "22 is the wake-on-USB flag, set"
+assert_not_contains "$(stub_log "$F" i2cset)" " 19 255" "255 never reaches register 19"
+assert_eq "1"   "$(reg_dec "$F" 17)" "the shared rows are unchanged: 17 default-on"
+assert_eq "250" "$(reg_dec "$F" 21)" "21 power-cut delay"
+assert_eq "26"  "$(reg_dec "$F" 49)" "49 guaranteed wake"
+run_rpi_unit "$F" wittypi check
+assert_eq "0" "$RUN_RC" "check then reports it in sync"
+unset WP_STUB_ID WITTYPI_TOPOLOGY
+fixture_rm "$F"
+
+describe "...and the classic board keeps its own usb5v rows"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WITTYPI_TOPOLOGY=usb5v
+run_rpi_unit "$F" wittypi configure
+assert_eq "0" "$RUN_RC" "applied"
+assert_eq "255" "$(reg_dec "$F" 19)" "19 is 255, disabled, on the classic"
+assert_eq "255" "$(reg_dec "$F" 22)" "22 is 255, disabled, on the classic"
+unset WITTYPI_TOPOLOGY
+fixture_rm "$F"
+
+describe "L3V7: the classic battery topologies are refused before any write"
+for topo in vin2s vin3s; do
+    F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+    export WP_STUB_ID=0x37 WITTYPI_TOPOLOGY=$topo
+    run_rpi_unit "$F" wittypi configure
+    assert_eq "2" "$RUN_RC" "$topo on an L3V7 exits 2"
+    assert_contains "$RUN_OUT" "L3V7" "and says why"
+    no_writes "$F" "$topo wrote nothing"
+    fixture_rm "$F"
+done
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WP_STUB_ID=0x37 WITTYPI_TOPOLOGY=usb5v WITTYPI_LOW_VOLTAGE=6.6
+run_rpi_unit "$F" wittypi configure
+assert_eq "2" "$RUN_RC" "a threshold with usb5v is still refused on the L3V7"
+no_writes "$F" "and wrote nothing"
+unset WP_STUB_ID WITTYPI_TOPOLOGY WITTYPI_LOW_VOLTAGE
+fixture_rm "$F"
+
+describe "L3V7 with no topology: refused on battery, skipped on USB-C"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WP_STUB_ID=0x37
+printf '0x02\n' > "$F/regs/7"
+run_rpi_unit "$F" wittypi configure
+assert_eq "2" "$RUN_RC" "POWER_MODE 2 (battery) with no topology exits 2"
+no_writes "$F" "and wrote nothing"
+printf '0x00\n' > "$F/regs/7"
+run_rpi_unit "$F" wittypi configure
+assert_eq "0" "$RUN_RC" "POWER_MODE 0 (USB-C) applies the rest"
+assert_not_contains "$(stub_log "$F" i2cset)" " 19 " "without touching 19"
+assert_not_contains "$(stub_log "$F" i2cset)" " 22 " "or 22"
+unset WP_STUB_ID
+fixture_rm "$F"
+
+describe "L3V7: the raw set refuses classic values in 19 and 22"
+F=$(fixture_new); stub_i2c "$F"; stub_board_rev7 "$F"
+export WP_STUB_ID=0x37
+for bad in "LOW_VOLTAGE 255" "LOW_VOLTAGE 66" "LOW_VOLTAGE 0x" "RECOVERY_VOLTAGE 70" "RECOVERY_VOLTAGE 255"; do
+    # shellcheck disable=SC2086  # the pair is two arguments on purpose
+    run_rpi_unit "$F" wittypi set $bad
+    assert_eq "2" "$RUN_RC" "set $bad is refused"
+done
+no_writes "$F" "none of them reached the bus"
+run_rpi_unit "$F" wittypi set RECOVERY_VOLTAGE 0
+assert_eq "0" "$RUN_RC" "set RECOVERY_VOLTAGE 0 (no wake on USB) is allowed"
+assert_eq "0" "$(reg_dec "$F" 22)" "and written"
+run_rpi_unit "$F" wittypi set LOW_VOLTAGE 33
+assert_eq "33" "$(reg_dec "$F" 19)" "a 1S cutoff is allowed"
+unset WP_STUB_ID
+run_rpi_unit "$F" wittypi set LOW_VOLTAGE 255
+assert_eq "0" "$RUN_RC" "the classic board's set is as permissive as it was"
+fixture_rm "$F"
+
+describe "L3V7 policies through wp_sanity"
+F=$(fixture_new); stub_i2c_seq "$F"
+SANE_MODEL=l3v7
+pol_write "$F" "$(R 19 31)" "$(R 22 1)"
+sane "$F" && rc=0 || rc=1
+assert_eq "0" "$rc" "19 = 31, 22 = 1 passes — no classic hysteresis rule applied"
+pol_write "$F" "$(R 19 255)" "$(R 22 255)"
+sane "$F" && rc=0 || rc=1
+assert_eq "1" "$rc" "the classic usb5v pair is refused on an L3V7"
+pol_write "$F" "$(R 19 31)" "$(R 22 70)"
+sane "$F" && rc=0 || rc=1
+assert_eq "1" "$rc" "a voltage in 22 is refused"
+SANE_MODEL=none
+pol_write "$F" "$(R 17 1)"
+sane "$F" && rc=0 || rc=1
+assert_eq "1" "$rc" "with no identified model, nothing passes"
+unset SANE_MODEL
+fixture_rm "$F"
+
+describe "decoding reads the L3V7's meanings, not the classic's"
+F=$(fixture_new)
+assert_contains "$(hw_call "$F" "WP_MODEL=l3v7; wp_reg_decode 7 2")" "battery" "7 = 2 is the battery"
+assert_contains "$(hw_call "$F" "WP_MODEL=l3v7; wp_reg_decode 22 1")" "USB returns" "22 is a flag"
+assert_contains "$(hw_call "$F" "WP_MODEL=l3v7; wp_reg_decode 19 255")" "INVALID" "255 in 19 is flagged"
+assert_contains "$(hw_call "$F" "WP_MODEL=l3v7; wp_reg_decode 0 55")" "L3V7" "0x37 is named"
+assert_contains "$(hw_call "$F" wp_reg_decode 11 9)" "USB 5V connected" "reason 9"
+assert_eq "disabled" "$(hw_call "$F" "WP_MODEL=wp4; wp_reg_decode 22 255")" "the classic 22 is unchanged"
 fixture_rm "$F"

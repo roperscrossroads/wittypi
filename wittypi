@@ -57,6 +57,7 @@ are properties of the installation and not of the image. On the board they
 come from /data/wittypi.env via the unit.
 
   WITTYPI_TOPOLOGY         usb5v | vin2s | vin3s   — THE one that matters
+                           (a Witty Pi 4 L3V7 supports usb5v only)
   WITTYPI_LOW_VOLTAGE      volts (register 19; vin* only, defaults per topology)
   WITTYPI_RECOVERY_VOLTAGE volts (register 22; MUST exceed the above, and see
                            the starvation warning — low is safer than high)
@@ -227,6 +228,32 @@ wp_emit() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
 
 wp_policy() {
     wp_p_lv=''; wp_p_rv=''; wp_p_full=''
+    wp_p_rv_label='recovery voltage (x10 V)'
+
+    # ── The L3V7 runs only the topology it was bought for here ─────────────
+    # vin2s/vin3s describe the classic board's DC/DC input, and their numbers
+    # mean something else on an L3V7: 6.6 V in register 19 reads as "battery
+    # always low" (and gates guaranteed wake shut), and any recovery voltage
+    # in 22 is just "on". Refused, not translated — WP_ID_* in the lib.
+    if [ "$WP_MODEL" = l3v7 ]; then
+        case "${WITTYPI_TOPOLOGY:-}" in
+        vin2s|vin3s)
+            printf 'REFUSING: topology %s on a Witty Pi 4 L3V7.
+' "$WITTYPI_TOPOLOGY" >&2
+            printf 'That topology is a pack on the classic board'"'"'s DC/DC input. On the L3V7
+' >&2
+            printf 'register 19 is a 1S Li-ion cutoff and register 22 is a wake-on-USB flag,
+' >&2
+            printf 'so its thresholds would be written as nonsense: a 2S/3S cutoff reads as
+' >&2
+            printf '"battery always low" and blocks guaranteed wake whenever it is on battery.
+' >&2
+            printf 'Supported on the L3V7: usb5v.
+' >&2
+            exit 2
+            ;;
+        esac
+    fi
 
     # ── The topology decides three registers, and only these three ─────────
     case "${WITTYPI_TOPOLOGY:-}" in
@@ -244,7 +271,20 @@ wp_policy() {
             printf 'protection. On this topology the battery belongs to the charger board.\n' >&2
             exit 2
         fi
-        wp_p_lv=$WP_EEPROM_UNSET; wp_p_rv=$WP_EEPROM_UNSET
+        if [ "$WP_MODEL" = l3v7 ]; then
+            # Not 255: on the L3V7 register 19 seeds 31, so a written 255
+            # reverts at the next MCU power loss, and while it stands it makes
+            # guaranteed wake on battery wait for vin > 25.5 V — never. 31 is
+            # the vendor seed: inert on a USB feed (the low-voltage path is
+            # gated on POWER_MODE != 0) and right if the board is ever on a
+            # cell. 22 = 1 is the vendor's own meaning of its seed (255, any
+            # non-zero): with no battery it never fires; with one fitted as a
+            # UPS it is "power returns, the Pi returns" — DEFAULT_ON's analogue.
+            wp_p_lv=$WP_L3V7_LOW_VOLTAGE; wp_p_rv=1
+            wp_p_rv_label='wake on USB return (L3V7 flag)'
+        else
+            wp_p_lv=$WP_EEPROM_UNSET; wp_p_rv=$WP_EEPROM_UNSET
+        fi
         ;;
     vin2s)
         wp_p_lv=$(wp_volts_to_reg "${WITTYPI_LOW_VOLTAGE:-6.6}")
@@ -282,7 +322,25 @@ wp_policy() {
         # log. The board can tell us which topology it is actually in; asking
         # it is free.
         wp_p_mode=$(wp_get "$WP_REG_POWER_MODE") || wp_p_mode=0
-        if [ "$wp_p_mode" = "1" ]; then
+        # The L3V7 encodes "on battery" as 2 and never reads 1, so the
+        # classic test would wave a battery-powered L3V7 through. There,
+        # anything but 0 (USB-C) is refused.
+        if [ "$WP_MODEL" = l3v7 ] && [ "$wp_p_mode" != "0" ]; then
+            printf 'REFUSING: WITTYPI_TOPOLOGY is unset, and this L3V7 reports register %s
+' \
+                "$WP_REG_POWER_MODE" >&2
+            printf '= %s — it is not on 5V USB-C (2 = running from the battery). There
+' "$wp_p_mode" >&2
+            printf 'register %s IS the battery cutoff, and skipping it leaves whatever the
+' \
+                "$WP_REG_LOW_VOLTAGE" >&2
+            printf 'EEPROM holds standing in for one. Set WITTYPI_TOPOLOGY=usb5v in
+' >&2
+            printf '/data/wittypi.env (the only topology supported on the L3V7).
+' >&2
+            exit 2
+        fi
+        if [ "$WP_MODEL" != l3v7 ] && [ "$wp_p_mode" = "1" ]; then
             printf 'REFUSING: WITTYPI_TOPOLOGY is unset, and the board reports register %s\n' \
                 "$WP_REG_POWER_MODE" >&2
             printf '= 1 — it is running from the DC/DC (VIN) input, off a pack.\n' >&2
@@ -317,7 +375,10 @@ wp_policy() {
         # Hysteresis must be the right way round or the board oscillates: below
         # 19 it shuts down, above 22 it comes back, so 22 <= 19 lets it wake
         # into an immediate shutdown forever. Both-disabled is exempt.
-        if [ "$wp_p_lv" != "$WP_EEPROM_UNSET" ] && [ "$wp_p_rv" -le "$wp_p_lv" ]; then
+        # Classic only — on the L3V7 register 22 is a flag, not the upper
+        # half of a hysteresis pair.
+        if [ "$WP_MODEL" != l3v7 ] && [ "$wp_p_lv" != "$WP_EEPROM_UNSET" ] \
+           && [ "$wp_p_rv" -le "$wp_p_lv" ]; then
             printf 'REFUSING: recovery voltage (%s) must EXCEED low voltage (%s),\n' \
                 "$wp_p_rv" "$wp_p_lv" >&2
             printf 'or the board oscillates between shutdown and wake.\n' >&2
@@ -337,7 +398,7 @@ wp_policy() {
             printf 'Prefer a value just above the low-voltage cutoff.\n' >&2
         fi
         wp_emit "$WP_REG_LOW_VOLTAGE"      "$wp_p_lv" 'low voltage (x10 V)'
-        wp_emit "$WP_REG_RECOVERY_VOLTAGE" "$wp_p_rv" 'recovery voltage (x10 V)'
+        wp_emit "$WP_REG_RECOVERY_VOLTAGE" "$wp_p_rv" "$wp_p_rv_label"
     fi
 
     # 41: there is no configuration in this design where 1 is correct. On usb5v
@@ -384,6 +445,9 @@ wp_policy() {
     # written" and replaces it with the compiled default (0 for this register),
     # so the value would survive only until the next power loss — the exact
     # event it exists for.
+    #
+    # The L3V7 runs the same delay(reg * 1000) a second time, on its
+    # USB-returned wake (register 22), so the same ceiling covers it there.
     wp_p_don=$(wp_dec10 "${WITTYPI_DEFAULT_ON_DELAY:-$WP_FALLBACK_DEFAULT_ON_DELAY}")
     if [ "$wp_p_don" -ge "$WP_EEPROM_UNSET" ]; then
         printf 'REFUSING: default-on delay %s cannot be stored in register %s.\n' \
@@ -545,6 +609,7 @@ case "$WP_CMD" in
 status)
     wp_require
     wp_cli_lock s 10
+    printf 'controller        %s\n' "$(wp_model_name)"
     printf 'firmware id       0x%02x\n' "$(wp_get "$WP_REG_ID")"
     wp_rev=$(wp_get "$WP_REG_FW_REVISION")
     printf 'firmware revision %s\n' "$wp_rev"
@@ -556,8 +621,8 @@ status)
         printf '                  This board has TWO rollback defences, not three.\n'
     fi
     printf 'last action       reason %s\n' "$(wp_get "$WP_REG_ACTION_REASON")"
-    printf 'power mode        %s\n' \
-        "$([ "$(wp_get "$WP_REG_POWER_MODE")" = "1" ] && echo 'VIN (DC/DC)' || echo '5V USB-C')"
+    wp_pm=$(wp_get "$WP_REG_POWER_MODE") || wp_pm=''
+    printf 'power mode        %s\n' "$(wp_reg_decode "$WP_REG_POWER_MODE" "${wp_pm:-0}")"
     printf 'Vin               %sV\n'  "$(wp_read_pair "$WP_REG_VIN_INT"  "$WP_REG_VIN_DEC")"
     printf 'Vout              %sV\n'  "$(wp_read_pair "$WP_REG_VOUT_INT" "$WP_REG_VOUT_DEC")"
     printf 'Iout              %sA'    "$(wp_read_pair "$WP_REG_IOUT_INT" "$WP_REG_IOUT_DEC")"
@@ -811,6 +876,10 @@ set)
     wp_cli_lock x 20
     [ $# -eq 3 ] || { wp_usage; exit 1; }
     wp_r=$(wp_reg_num "$2") || exit 2
+    # The raw escape hatch still goes through the per-model check: on an
+    # L3V7 a classic-board value in 19 or 22 is not a typo, it is a
+    # different setting (see wp_vet_write).
+    wp_vet_write "$wp_r" "$3" || exit 2
     wp_set "$wp_r" "$3"
     ;;
 
